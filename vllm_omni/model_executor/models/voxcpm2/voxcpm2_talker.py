@@ -1756,7 +1756,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         )
 
         g = _CapturedUnifiedDecodeGraph(
-            graph=torch.cuda.CUDAGraph(),
+            graph=torch.npu.NPUGraph(),
             batch_size=batch_size,
             input_embeds=torch.zeros(batch_size, H, device=dev, dtype=dtype),
             positions=torch.zeros(batch_size, device=dev, dtype=torch.long),
@@ -1799,11 +1799,17 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         capture_context = override_forward_context(self._nullify_volatile_metadata(ctx))
 
         original_estimator = tts.feat_decoder.estimator
-        capture_estimator = self._voxcpm2_compile_unified_capture_estimator(original_estimator)
+        if self._enable_torch_compile:
+            capture_estimator = self._voxcpm2_compile_unified_capture_estimator(original_estimator)
+        else:
+            capture_estimator = original_estimator
         tts.feat_decoder.estimator = capture_estimator
 
         original_feat_encoder = tts.feat_encoder
-        capture_feat_encoder = self._voxcpm2_compile_unified_capture_feat_encoder(original_feat_encoder)
+        if self._enable_torch_compile:
+            capture_feat_encoder = self._voxcpm2_compile_unified_capture_feat_encoder(original_feat_encoder)
+        else:
+            capture_feat_encoder = original_feat_encoder
         tts.feat_encoder = capture_feat_encoder
 
         try:
@@ -1814,7 +1820,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                         unified_fwd()
 
                     g.cfm_noise.normal_()
-                    with torch.cuda.graph(g.graph, pool=current_platform.get_global_graph_pool()):
+                    with torch.npu.graph(g.graph, pool=current_platform.get_global_graph_pool()):
                         g.next_feat_embed, g.cfm_output, g.lm_hidden = unified_fwd()
         finally:
             tts.feat_decoder.estimator = original_estimator
