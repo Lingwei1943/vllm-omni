@@ -1755,8 +1755,16 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             max_batch_size=batch_size,
         )
 
+        # Platform-aware graph API: NPU uses NPUGraph, CUDA keeps CUDAGraph.
+        if current_omni_platform.is_npu():
+            graph_api = torch.npu.NPUGraph
+            graph_ctx = torch.npu.graph
+        else:
+            graph_api = torch.cuda.CUDAGraph
+            graph_ctx = torch.cuda.graph
+
         g = _CapturedUnifiedDecodeGraph(
-            graph=torch.npu.NPUGraph(),
+            graph=graph_api(),
             batch_size=batch_size,
             input_embeds=torch.zeros(batch_size, H, device=dev, dtype=dtype),
             positions=torch.zeros(batch_size, device=dev, dtype=torch.long),
@@ -1805,6 +1813,17 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             capture_estimator = original_estimator
         tts.feat_decoder.estimator = capture_estimator
 
+        # If the NPU post-load patch wrapped the estimator's forward with an
+        # NPUExactGraphRunner, unwrap it during unified capture: nested graph
+        # capture (inner exact-shape runner inside an outer NPUGraph) is not
+        # supported. Capture uses the original eager forward and the wrap is
+        # re-applied in the finally block below.
+        npu_wrapped_forward = None
+        npu_original_forward = getattr(tts.feat_decoder.estimator, "_voxcpm2_npu_original_forward", None)
+        if npu_original_forward is not None:
+            npu_wrapped_forward = tts.feat_decoder.estimator.forward
+            tts.feat_decoder.estimator.forward = npu_original_forward
+
         original_feat_encoder = tts.feat_encoder
         if self._enable_torch_compile:
             capture_feat_encoder = self._voxcpm2_compile_unified_capture_feat_encoder(original_feat_encoder)
@@ -1820,11 +1839,14 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                         unified_fwd()
 
                     g.cfm_noise.normal_()
-                    with torch.npu.graph(g.graph, pool=current_platform.get_global_graph_pool()):
+                    with graph_ctx(g.graph, pool=current_platform.get_global_graph_pool()):
                         g.next_feat_embed, g.cfm_output, g.lm_hidden = unified_fwd()
         finally:
             tts.feat_decoder.estimator = original_estimator
             tts.feat_encoder = original_feat_encoder
+            # Re-apply the LocDiT NPUGraph wrap that was unwrapped for capture.
+            if npu_wrapped_forward is not None:
+                tts.feat_decoder.estimator.forward = npu_wrapped_forward
         self._unified_graph_stats.captures += 1
         logger.info(
             "CUDA Graph captured for unified decode (batch_size=%d, captures=%d)",

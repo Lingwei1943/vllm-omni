@@ -57,5 +57,9 @@ def setup_voxcpm2_loc_dit_npu_graph(model: object) -> None:
 
     estimator.forward = MethodType(_forward, estimator)
     estimator._voxcpm2_npu_graph_runner = graph_runner
+    # Keep the original (unwrapped) forward reachable so the unified decode
+    # graph capture can temporarily restore eager execution and avoid nested
+    # graph capture (inner exact-shape runner inside an outer NPUGraph).
+    estimator._voxcpm2_npu_original_forward = original_forward
     estimator._compiled = True
     logger.info("VoxCPM2 LocDiT NPUGraph replay enabled (max_graphs=%d)", _MAX_GRAPHS)
