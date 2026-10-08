@@ -1756,6 +1756,12 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         )
 
         # Platform-aware graph API: NPU uses NPUGraph, CUDA keeps CUDAGraph.
+        # Local import: upstream has both `from vllm_omni.platforms import
+        # current_omni_platform` and `import vllm_omni.platforms as
+        # omni_platform` styles across revisions; a function-local import
+        # resolves against either.
+        from vllm_omni.platforms import current_omni_platform
+
         if current_omni_platform.is_npu():
             graph_api = torch.npu.NPUGraph
             graph_ctx = torch.npu.graph

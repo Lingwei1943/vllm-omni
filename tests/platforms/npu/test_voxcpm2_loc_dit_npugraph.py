@@ -124,7 +124,12 @@ def test_unified_capture_selects_platform_graph_api(monkeypatch) -> None:
     NPUGraph on NPU instead of hardcoding one backend (regression pin)."""
     import torch.npu
 
-    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
+    # Import the platform singleton from the package so the test survives
+    # upstream refactors of how voxcpm2_talker.py binds the name (both
+    # `from vllm_omni.platforms import current_omni_platform` and
+    # `import vllm_omni.platforms as omni_platform` styles reference this
+    # same object).
+    from vllm_omni.platforms import current_omni_platform
 
     selected = {}
 
@@ -137,13 +142,13 @@ def test_unified_capture_selects_platform_graph_api(monkeypatch) -> None:
     def fake_is_npu():
         return selected["is_npu"]
 
-    monkeypatch.setattr(talker_mod.current_omni_platform, "is_npu", fake_is_npu)
+    monkeypatch.setattr(current_omni_platform, "is_npu", fake_is_npu)
     monkeypatch.setattr(torch.npu, "NPUGraph", FakeNpuGraph, raising=False)
     monkeypatch.setattr(torch.cuda, "CUDAGraph", FakeCudaGraph, raising=False)
 
-    # Rebind the platform-aware selection the same way the capture does.
+    # Mirror the platform-aware selection the capture performs.
     def pick():
-        if talker_mod.current_omni_platform.is_npu():
+        if current_omni_platform.is_npu():
             return torch.npu.NPUGraph
         return torch.cuda.CUDAGraph
 
