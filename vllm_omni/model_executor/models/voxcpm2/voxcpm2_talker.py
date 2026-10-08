@@ -61,12 +61,30 @@ _VAE_NPU_GRAPH_RUNNER = None
 def _get_vae_npu_graph_runner():
     global _VAE_NPU_GRAPH_RUNNER
     if _VAE_NPU_GRAPH_RUNNER is None:
+        # Escape hatch: operators can disable the AudioVAE NPUGraph after a
+        # failed capture without restarting the process.
+        import os
+
+        if os.environ.get("VLLM_OMNI_DISABLE_VAE_NPU_GRAPH", "0") == "1":
+            logger.info("AudioVAE NPUGraph disabled via VLLM_OMNI_DISABLE_VAE_NPU_GRAPH")
+            _VAE_NPU_GRAPH_RUNNER = False
+            return None
+        # Only construct the runner on NPU platforms; CUDA runtimes without
+        # torch.npu would raise AttributeError on the config access below.
+        if not current_omni_platform.is_npu():
+            _VAE_NPU_GRAPH_RUNNER = False
+            return None
         from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
+
         torch.npu.config.allow_internal_format = False
+        # Dedicated pool: isolate this component's graphs from other
+        # components sharing the global pool. Prevents cross-graph memory
+        # reuse corruption when many graphs are cached.
         _VAE_NPU_GRAPH_RUNNER = NPUExactGraphRunner(
             max_graphs=8,
             component_name="VoxCPM2 AudioVAE",
-            disable_config_hint="disable the AudioVAE NPUGraph",
+            disable_config_hint="disable the AudioVAE NPUGraph (set VLLM_OMNI_DISABLE_VAE_NPU_GRAPH=1)",
+            use_shared_pool=False,
         )
         if not _VAE_NPU_GRAPH_RUNNER.is_supported():
             logger.warning("AudioVAE NPUGraph not supported; using eager execution")
