@@ -71,6 +71,12 @@ def _get_vae_npu_graph_runner():
             return None
         # Only construct the runner on NPU platforms; CUDA runtimes without
         # torch.npu would raise AttributeError on the config access below.
+        # Local import: upstream has both `from vllm_omni.platforms import
+        # current_omni_platform` and `import vllm_omni.platforms as
+        # omni_platform` styles across revisions; a function-local import
+        # resolves against either.
+        from vllm_omni.platforms import current_omni_platform
+
         if not current_omni_platform.is_npu():
             _VAE_NPU_GRAPH_RUNNER = False
             return None
