@@ -940,12 +940,17 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         # Wrap audio_vae.encode so all callers (_encode_raw_audio, native
         # _encode_wav / build_prompt_cache) auto-cast input to vae_dtype,
-        # preventing fp32/bf16 mismatch errors on Ascend NPU.
+        # preventing fp32/bf16 mismatch errors on Ascend NPU. The output is
+        # cast back to float32 to preserve the historical contract of the
+        # cached prompt features: _build_prefill_inputs concatenates them
+        # with fp32 zero padding (torch.cat requires matching dtypes) for
+        # voice-clone / continuation / ICL prefill.
         _original_vae_encode = self._tts.audio_vae.encode
 
         def _dtype_aware_encode(audio_data, sample_rate, *args, **kwargs):
             audio_data = audio_data.to(dtype=self._vae_dtype)
-            return _original_vae_encode(audio_data, sample_rate, *args, **kwargs)
+            result = _original_vae_encode(audio_data, sample_rate, *args, **kwargs)
+            return result.float()
 
         self._tts.audio_vae.encode = _dtype_aware_encode
         self._patch_size = self._tts.patch_size
@@ -3129,7 +3134,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     ):
                         sizes = [int(chunk.numel()) for chunk in chunks]
                         merged = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
-                        merged_cpu = merged.detach().cpu().contiguous()
+                        merged_cpu = merged.detach().cpu().float().contiguous()
                         mm["model_outputs"] = list(merged_cpu.split(sizes))
                     else:
                         mm["model_outputs"] = chunks
