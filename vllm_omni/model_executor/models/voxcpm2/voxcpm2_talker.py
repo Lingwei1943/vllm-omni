@@ -2812,10 +2812,16 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             return
 
         stacked = torch.stack([stop_logits[0] for _, stop_logits in pending], dim=0)
+        stop_mask_gpu = stacked[:, 1] > stacked[:, 0]
         stop_mask_cpu = torch.empty(len(pending), dtype=torch.bool, pin_memory=True)
-        stop_mask_cpu.copy_(stacked[:, 1] > stacked[:, 0], non_blocking=True)
+        stop_mask_cpu.copy_(stop_mask_gpu, non_blocking=True)
+        # Keep the GPU source tensor alive until the D2H copy is synchronized.
+        # The copy is implicitly synced when pending_stop_mask_cpu is read in
+        # _should_stop_from_cached_logits; until then, stop_mask_gpu prevents
+        # the caching allocator from reusing the source memory.
         for i, (state, _) in enumerate(pending):
             state.pending_stop_mask_cpu = stop_mask_cpu[i : i + 1]
+        self._pending_stop_mask_source = stop_mask_gpu
 
     def _should_stop_from_cached_logits(self, state: _RequestState) -> bool:
         if state.is_stopping:
@@ -3056,6 +3062,8 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                         logits[i, 0] = stop_logits[0, 0]
                         logits[i, 1] = stop_logits[0, 1]
                         if state is not None:
+                            if state.pending_stop_mask_cpu is not None:
+                                self._should_stop_from_cached_logits(state)
                             if state.precomputed_is_stopping is not None:
                                 state.is_stopping = state.precomputed_is_stopping
                             state.precomputed_stop_logits = None
