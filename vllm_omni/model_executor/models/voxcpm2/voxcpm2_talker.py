@@ -259,7 +259,8 @@ def _encode_raw_audio(
         audio = torch.nn.functional.pad(audio, pad)
 
     vae_device = next(tts.audio_vae.parameters()).device
-    feat = tts.audio_vae.encode(audio.to(vae_device), encode_sr).cpu()
+    vae_dtype = next(tts.audio_vae.parameters()).dtype
+    feat = tts.audio_vae.encode(audio.to(device=vae_device, dtype=vae_dtype), encode_sr).cpu()
     return feat.view(tts.audio_vae.latent_dim, -1, tts.patch_size).permute(1, 2, 0)
 
 
@@ -936,6 +937,17 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         self._side_dtype = self._tts.fusion_concat_proj.weight.dtype
         self._vae_dtype = next(self._tts.audio_vae.parameters()).dtype
+
+        # Wrap audio_vae.encode so all callers (_encode_raw_audio, native
+        # _encode_wav / build_prompt_cache) auto-cast input to vae_dtype,
+        # preventing fp32/bf16 mismatch errors on Ascend NPU.
+        _original_vae_encode = self._tts.audio_vae.encode
+
+        def _dtype_aware_encode(audio_data, sample_rate, *args, **kwargs):
+            audio_data = audio_data.to(dtype=self._vae_dtype)
+            return _original_vae_encode(audio_data, sample_rate, *args, **kwargs)
+
+        self._tts.audio_vae.encode = _dtype_aware_encode
         self._patch_size = self._tts.patch_size
         self._feat_dim = self._tts.feat_dim
         self._sample_rate = getattr(self.config, "sample_rate", 48000)
