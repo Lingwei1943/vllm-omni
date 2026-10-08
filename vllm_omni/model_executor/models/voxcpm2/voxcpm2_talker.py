@@ -277,6 +277,7 @@ class _RequestState:
     is_stopping: bool = False
     precomputed_is_stopping: bool | None = None
     pending_stop_mask_cpu: torch.Tensor | None = None
+    pending_stop_mask_event: object | None = None
     prefill_embeds: torch.Tensor | None = None
 
 
@@ -2700,6 +2701,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         state.precomputed_stop_logits = stop_logits
         state.precomputed_is_stopping = None
         state.pending_stop_mask_cpu = None
+        state.pending_stop_mask_event = None
         state.curr_embed_for_next = next_embed.detach()
         state.prev_feat_embed = next_embed.detach()
         state.curr_prefix_feat_cond = pred_feat[0].detach()
@@ -2815,12 +2817,16 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         stop_mask_gpu = stacked[:, 1] > stacked[:, 0]
         stop_mask_cpu = torch.empty(len(pending), dtype=torch.bool, pin_memory=True)
         stop_mask_cpu.copy_(stop_mask_gpu, non_blocking=True)
-        # Keep the GPU source tensor alive until the D2H copy is synchronized.
-        # The copy is implicitly synced when pending_stop_mask_cpu is read in
-        # _should_stop_from_cached_logits; until then, stop_mask_gpu prevents
-        # the caching allocator from reusing the source memory.
+        # Record an event on the current stream (after the D2H enqueue) so
+        # consumers can wait for the copy to land before reading the pinned
+        # buffer; a host read of pinned memory does not wait on its own.
+        device_module = torch.get_device_module(stop_mask_gpu.device)
+        stop_mask_event = device_module.Event()
+        stop_mask_event.record()
+        # Keep the GPU source tensor alive until the D2H copy completes.
         for i, (state, _) in enumerate(pending):
             state.pending_stop_mask_cpu = stop_mask_cpu[i : i + 1]
+            state.pending_stop_mask_event = stop_mask_event
         self._pending_stop_mask_source = stop_mask_gpu
 
     def _should_stop_from_cached_logits(self, state: _RequestState) -> bool:
@@ -2830,6 +2836,12 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         if cached is not None:
             return cached
         if state.pending_stop_mask_cpu is not None:
+            # Block the host until the async D2H copy has landed, mirroring
+            # the delayed-audio path's event wait before host-buffer reads.
+            event = state.pending_stop_mask_event
+            if event is not None:
+                event.synchronize()
+                state.pending_stop_mask_event = None
             is_stopping = bool(state.pending_stop_mask_cpu[0])
             state.pending_stop_mask_cpu = None
             state.precomputed_is_stopping = is_stopping
@@ -3058,6 +3070,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                         state.precomputed_stop_logits = None
                         state.precomputed_is_stopping = None
                         state.pending_stop_mask_cpu = None
+                        state.pending_stop_mask_event = None
                     else:
                         logits[i, 0] = stop_logits[0, 0]
                         logits[i, 1] = stop_logits[0, 1]
@@ -3069,6 +3082,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                             state.precomputed_stop_logits = None
                             state.precomputed_is_stopping = None
                             state.pending_stop_mask_cpu = None
+                            state.pending_stop_mask_event = None
                 elif state and state.prefill_completed:
                     logits[i, 1] = 1.0
                 else:
@@ -3202,6 +3216,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 state.precomputed_stop_logits = None
                 state.precomputed_is_stopping = None
                 state.pending_stop_mask_cpu = None
+                state.pending_stop_mask_event = None
                 state.last_audio_patch_gpu = None
                 # SamplingParams.seed reaches vLLM's own sampler but never the
                 # CFM noise draws below, so a seeded request threads its seed
