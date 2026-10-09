@@ -56,6 +56,27 @@ logger = init_logger(__name__)
 _ENABLE_NVTX_PROFILE = False
 
 
+def _install_dtype_aware_encode(tts: nn.Module, vae_dtype: torch.dtype) -> None:
+    """Wrap ``audio_vae.encode`` so every caller is dtype-safe under a bf16 VAE.
+
+    Inputs are cast to ``vae_dtype`` (prevents fp32/bf16 mismatch errors on
+    Ascend NPU for callers like ``_encode_raw_audio`` and the native
+    ``_encode_wav`` / ``build_prompt_cache``). The result is cast back to
+    float32 to preserve the historical contract of the cached prompt
+    features: ``_build_prefill_inputs`` concatenates them with fp32 zero
+    padding, and ``torch.cat`` requires matching dtypes (voice-clone /
+    continuation / ICL prefill would raise otherwise).
+    """
+    original_encode = tts.audio_vae.encode
+
+    def _dtype_aware_encode(audio_data, sample_rate, *args, **kwargs):
+        audio_data = audio_data.to(dtype=vae_dtype)
+        result = original_encode(audio_data, sample_rate, *args, **kwargs)
+        return result.float()
+
+    tts.audio_vae.encode = _dtype_aware_encode
+
+
 def _remove_weight_norm_from_module(module: nn.Module) -> None:
     """Recursively remove weight_norm from all submodules.
 
@@ -939,20 +960,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._vae_dtype = next(self._tts.audio_vae.parameters()).dtype
 
         # Wrap audio_vae.encode so all callers (_encode_raw_audio, native
-        # _encode_wav / build_prompt_cache) auto-cast input to vae_dtype,
-        # preventing fp32/bf16 mismatch errors on Ascend NPU. The output is
-        # cast back to float32 to preserve the historical contract of the
-        # cached prompt features: _build_prefill_inputs concatenates them
-        # with fp32 zero padding (torch.cat requires matching dtypes) for
-        # voice-clone / continuation / ICL prefill.
-        _original_vae_encode = self._tts.audio_vae.encode
-
-        def _dtype_aware_encode(audio_data, sample_rate, *args, **kwargs):
-            audio_data = audio_data.to(dtype=self._vae_dtype)
-            result = _original_vae_encode(audio_data, sample_rate, *args, **kwargs)
-            return result.float()
-
-        self._tts.audio_vae.encode = _dtype_aware_encode
+        # _encode_wav / build_prompt_cache) are dtype-safe under the bf16
+        # cast; see _install_dtype_aware_encode for the fp32 output contract.
+        _install_dtype_aware_encode(self._tts, self._vae_dtype)
         self._patch_size = self._tts.patch_size
         self._feat_dim = self._tts.feat_dim
         self._sample_rate = getattr(self.config, "sample_rate", 48000)
