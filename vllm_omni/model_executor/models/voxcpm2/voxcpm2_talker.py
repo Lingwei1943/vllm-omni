@@ -64,8 +64,10 @@ def _install_dtype_aware_encode(tts: nn.Module, vae_dtype: torch.dtype) -> None:
     ``_encode_wav`` / ``build_prompt_cache``). The result is cast back to
     float32 to preserve the historical contract of the cached prompt
     features: ``_build_prefill_inputs`` concatenates them with fp32 zero
-    padding, and ``torch.cat`` requires matching dtypes (voice-clone /
-    continuation / ICL prefill would raise otherwise).
+    padding (voice-clone / continuation / ICL prefill). ``torch.cat`` would
+    silently type-promote a bf16 feature to float32 on torch 2.x, so without
+    this cast the cache would drift to bf16-precision values with no error
+    signal; the explicit float32 restore keeps the pre-PR cache precision.
     """
     original_encode = tts.audio_vae.encode
 

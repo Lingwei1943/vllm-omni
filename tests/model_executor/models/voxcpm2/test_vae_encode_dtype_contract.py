@@ -5,9 +5,11 @@
 The bf16 VAE cast wraps ``audio_vae.encode`` so it accepts fp32 waveforms
 and returns float32 features. ``_build_prefill_inputs`` concatenates the
 cached features with fp32 zero padding for voice-clone / continuation /
-ICL prefill; a bf16 feature there makes ``torch.cat`` raise. These tests
-pin that contract so dropping the output ``.float()`` cast (or letting a
-native cache recast to the bf16 parameter dtype) fails loudly.
+ICL prefill; a bf16 feature there would be silently type-promoted by
+``torch.cat`` (no error on torch 2.x), drifting the cache to bf16
+precision. These tests pin the explicit fp32 contract so dropping the
+output ``.float()`` cast (or letting a native cache recast to the bf16
+parameter dtype) is caught by the dtype assertion rather than silently.
 """
 
 from __future__ import annotations
