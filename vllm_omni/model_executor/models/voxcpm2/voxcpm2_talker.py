@@ -90,8 +90,18 @@ def _remove_weight_norm_from_module(module: nn.Module) -> None:
             try:
                 nn.utils.remove_weight_norm(m)
                 removed += 1
-            except (ValueError, RuntimeError):
-                pass
+            except (ValueError, RuntimeError) as exc:
+                # A failed materialization must not be silently skipped: the
+                # module would keep the per-forward norm path (the aten::to
+                # upcast this PR removes), and WeightNorm.remove can leave a
+                # module half-broken (weight deleted, hook still attached).
+                # Fail loudly at load time with the offending module named.
+                logger.error(
+                    "weight_norm removal failed for %s in audio_vae: %s",
+                    type(m).__name__,
+                    exc,
+                )
+                raise
     if removed:
         logger.info("Removed weight_norm from %d modules in audio_vae", removed)
 
