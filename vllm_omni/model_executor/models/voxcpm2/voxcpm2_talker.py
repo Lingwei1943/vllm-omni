@@ -1058,7 +1058,14 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         # Remove weight_norm from audio_vae: materialize final weights so
         # forward passes avoid recomputing norm (which forces fp32 aten::to).
         _remove_weight_norm_from_module(self._tts.audio_vae)
-        self._tts.audio_vae.to(dtype=torch.bfloat16)
+        # Follow the deployment dtype (--dtype) instead of hardcoding: the
+        # AudioVAE loads fp32 from audiovae.pth outside vLLM's dtype
+        # machinery, so without this it would stay fp32 under --dtype
+        # bfloat16. Deriving from model_config.dtype keeps the pipeline
+        # single-dtype for any configuration (float32 restores the original
+        # behavior; bfloat16 keeps the optimization).
+        vae_dtype = vllm_config.model_config.dtype
+        self._tts.audio_vae.to(dtype=vae_dtype)
 
         self._side_dtype = self._tts.fusion_concat_proj.weight.dtype
         self._vae_dtype = next(self._tts.audio_vae.parameters()).dtype
