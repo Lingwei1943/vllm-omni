@@ -246,8 +246,21 @@ class TestStateEvictionContract:
 
         talker._precompute_stop_flags_for_audio_collect(states)
 
+        # Async contract: the comparison result is staged in pinned memory
+        # and resolved lazily through the event-synchronized latch; nothing
+        # is latched until a consumer reads it.
+        assert states[0].pending_stop_mask_cpu is not None
+        assert states[0].pending_stop_mask_event is not None
+        assert states[0].precomputed_is_stopping is None
+        assert states[1].precomputed_is_stopping is None
+
+        # Resolving must latch the pinned bit, which after
+        # event.synchronize() matches stop_logits[:, 1] > stop_logits[:, 0]
+        # for each request.
+        assert talker._should_stop_from_cached_logits(states[0]) is True
         assert states[0].precomputed_is_stopping is True
         assert states[0].is_stopping is True
+        assert talker._should_stop_from_cached_logits(states[1]) is False
         assert states[1].precomputed_is_stopping is False
         assert states[1].is_stopping is False
 
