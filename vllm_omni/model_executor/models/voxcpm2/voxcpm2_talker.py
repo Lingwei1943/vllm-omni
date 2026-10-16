@@ -3345,6 +3345,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             if model_state is not None:
                 stacked.record_stream(self._stop_mask_stream)
             stop_mask_cpu = torch.empty(len(pending), dtype=torch.bool, pin_memory=True)
+            # Canary: a host read that races ahead of the DMA observes True —
+            # a deterministic wrong value for keep-going requests, caught by
+            # the latch test's expected-value assertion (instead of
+            # uninitialized garbage that can accidentally match).
+            stop_mask_cpu.fill_(True)
             stop_mask_cpu.copy_(stop_mask_gpu, non_blocking=True)
             copy_done.record(self._stop_mask_stream)
 
