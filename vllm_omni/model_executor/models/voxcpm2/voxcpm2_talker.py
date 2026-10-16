@@ -1184,6 +1184,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             return
         state = self._active_states.pop(request_id, None)
         if state is not None:
+            self._discard_pending_stop_mask(state)
             state.pending_audio_chunks_gpu.clear()
             state.pending_audio_copies.clear()
             state.pending_vae_latents_gpu.clear()
@@ -3365,7 +3366,13 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         state.pending_stop_mask_event = None
 
     def _should_stop_from_cached_logits(self, state: _RequestState) -> bool:
-        if state.is_stopping or state.audio_length_limit_reached:
+        if state.is_stopping:
+            return True
+        if state.audio_length_limit_reached:
+            # The request stops at its length limit; discard any pending
+            # stop-mask copy (with its event synchronized) so the in-flight
+            # D2H is not left writing into soon-to-be-reused memory.
+            self._discard_pending_stop_mask(state)
             return True
         cached = state.precomputed_is_stopping
         if cached is not None:
@@ -3384,13 +3391,6 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 state.is_stopping = True
             return is_stopping
         stop_logits = self._state_tensor(state, "precomputed_stop_logits")
-        if stop_logits is None:
-            return False
-        is_stopping = bool(stop_logits[0, 1] > stop_logits[0, 0])
-        state.precomputed_is_stopping = is_stopping
-        if is_stopping:
-            state.is_stopping = True
-        return is_stopping
         if stop_logits is None:
             return False
         is_stopping = bool(stop_logits[0, 1] > stop_logits[0, 0])
@@ -3666,6 +3666,12 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         model_state = getattr(self, "_mrv2_model_state", None)
         if model_state is not None and hidden_states.is_cuda:
+            # The MRV2 path decides stops via model_state directly; drain any
+            # pending stop-mask copies so their events/buffers are released
+            # instead of lingering until the states are dropped.
+            for state in self._active_states.values():
+                if state.pending_stop_mask_cpu is not None:
+                    self._discard_pending_stop_mask(state)
             return model_state.build_stop_logits(hidden_states)
 
         bsz = hidden_states.shape[0]

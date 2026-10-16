@@ -254,10 +254,28 @@ class TestStateEvictionContract:
         assert states[0].precomputed_is_stopping is None
         assert states[1].precomputed_is_stopping is None
 
+        # Pin the synchronization semantics: wrap the recorded event in a
+        # counting proxy. If the read path ever skips event.synchronize(),
+        # the assertions below fail.
+        class _RecordingEvent:
+            def __init__(self, inner):
+                self._inner = inner
+                self.sync_calls = 0
+
+            def synchronize(self):
+                self.sync_calls += 1
+                self._inner.synchronize()
+
+        recorder = _RecordingEvent(states[0].pending_stop_mask_event)
+        states[0].pending_stop_mask_event = recorder
+        recorder_keep = states[1].pending_stop_mask_event
+        states[1].pending_stop_mask_event = _RecordingEvent(recorder_keep)
+
         # Resolving must latch the pinned bit, which after
         # event.synchronize() matches stop_logits[:, 1] > stop_logits[:, 0]
         # for each request.
         assert talker._should_stop_from_cached_logits(states[0]) is True
+        assert recorder.sync_calls >= 1, "the pinned read must synchronize the copy event first"
         assert states[0].precomputed_is_stopping is True
         assert states[0].is_stopping is True
         assert talker._should_stop_from_cached_logits(states[1]) is False
