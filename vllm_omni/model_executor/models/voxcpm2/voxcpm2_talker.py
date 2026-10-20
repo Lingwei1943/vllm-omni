@@ -62,58 +62,77 @@ logger = init_logger(__name__)
 
 _ENABLE_NVTX_PROFILE = False
 
-_VAE_NPU_GRAPH_RUNNER = None
 _VAE_NPU_GRAPH_RUNNER_LOCK = threading.Lock()
+_NPU_INTERNAL_FORMAT_MUTATED = False
 
 
-def _init_vae_npu_graph_runner():
-    """Lazily construct (once, thread-safely) the AudioVAE NPUGraph runner.
+def _disable_npu_internal_format_once() -> None:
+    """One-shot process-global CANN requirement for NPUGraph capture.
 
-    Renamed from _get_vae_npu_graph_runner: this is an initializer with
-    side effects (global torch.npu.config mutation below), not a getter.
-    The allow_internal_format=False global is a one-shot CANN requirement
-    for NPUGraph capture of the VAE's Conv2D ops; it is idempotent and
-    required before any capture on this process.
+    ``allow_internal_format=False`` must hold process-wide before any
+    NPUGraph capture of the VAE's Conv2D ops; it is idempotent, so several
+    AudioVAE instances each calling this are harmless. CANN provides no
+    per-module scope for this switch, which is why the mutation lives in a
+    single guarded helper instead of being scattered across call sites.
     """
-    global _VAE_NPU_GRAPH_RUNNER
-    if _VAE_NPU_GRAPH_RUNNER is not None:
-        return _VAE_NPU_GRAPH_RUNNER
+    global _NPU_INTERNAL_FORMAT_MUTATED
+    if _NPU_INTERNAL_FORMAT_MUTATED:
+        return
     with _VAE_NPU_GRAPH_RUNNER_LOCK:
-        if _VAE_NPU_GRAPH_RUNNER is not None:
-            return _VAE_NPU_GRAPH_RUNNER
+        if not _NPU_INTERNAL_FORMAT_MUTATED:
+            torch.npu.config.allow_internal_format = False
+            _NPU_INTERNAL_FORMAT_MUTATED = True
+
+
+def _vae_npu_graph_runner_for(audio_vae: torch.nn.Module):
+    """Return this AudioVAE instance's own NPUGraph runner, lazily created.
+
+    The runner is attached to the AudioVAE instance and never shared between
+    instances: each instance captures its own weights into its own dedicated
+    graph pool, so two models with identical input signatures can never
+    replay each other's captured weights. ``None`` means not yet initialized;
+    ``False`` means NPU graphs are disabled for this instance (unsupported
+    platform or the operator escape hatch below).
+    """
+    runner = getattr(audio_vae, "_npu_graph_runner", None)
+    if runner is not None:
+        return runner
+    with _VAE_NPU_GRAPH_RUNNER_LOCK:
+        runner = getattr(audio_vae, "_npu_graph_runner", None)
+        if runner is not None:
+            return runner
         # Escape hatch: operators can disable the AudioVAE NPUGraph after a
         # failed capture without restarting the process.
         if os.environ.get("VLLM_OMNI_DISABLE_VAE_NPU_GRAPH", "0") == "1":
             logger.info("AudioVAE NPUGraph disabled via VLLM_OMNI_DISABLE_VAE_NPU_GRAPH")
-            _VAE_NPU_GRAPH_RUNNER = False
-            return _VAE_NPU_GRAPH_RUNNER
+            audio_vae._npu_graph_runner = False
+            return False
         # Only construct the runner on NPU platforms; CUDA runtimes without
         # torch.npu would raise AttributeError on the config access below.
-        # Local import: upstream has both `from vllm_omni.platforms import
-        # current_omni_platform` and `import vllm_omni.platforms as
-        # omni_platform` styles across revisions; a function-local import
-        # resolves against either.
-        from vllm_omni.platforms import current_omni_platform
-
-        if not current_omni_platform.is_npu():
-            _VAE_NPU_GRAPH_RUNNER = False
-            return _VAE_NPU_GRAPH_RUNNER
+        # Module-attribute access (not from-import): this helper can run while
+        # the platforms package is still initializing, where from-imports of
+        # the lazily-resolved platform singleton fail.
+        if not omni_platform.current_omni_platform.is_npu():
+            audio_vae._npu_graph_runner = False
+            return False
         from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
 
-        torch.npu.config.allow_internal_format = False
-        # Dedicated pool: isolate this component's graphs from other
-        # components sharing the global pool. Prevents cross-graph memory
-        # reuse corruption when many graphs are cached.
-        _VAE_NPU_GRAPH_RUNNER = NPUExactGraphRunner(
+        _disable_npu_internal_format_once()
+        # Dedicated pool per instance: isolate this component's graphs from
+        # other components and other model instances sharing the global pool.
+        # Prevents cross-graph memory reuse corruption when many graphs are
+        # cached.
+        runner = NPUExactGraphRunner(
             max_graphs=8,
             component_name="VoxCPM2 AudioVAE",
             disable_config_hint="disable the AudioVAE NPUGraph (set VLLM_OMNI_DISABLE_VAE_NPU_GRAPH=1)",
             use_shared_pool=False,
         )
-        if not _VAE_NPU_GRAPH_RUNNER.is_supported():
+        if not runner.is_supported():
             logger.warning("AudioVAE NPUGraph not supported; using eager execution")
-            _VAE_NPU_GRAPH_RUNNER = False
-    return _VAE_NPU_GRAPH_RUNNER
+            runner = False
+        audio_vae._npu_graph_runner = runner
+        return runner
 
 
 # Lower bound for the _active_states leak-warn threshold.  The effective
@@ -1770,9 +1789,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         feat = feat.to(dtype=vae_dtype)
         sr_cond = self._get_vae_decode_sr_cond(feat.device)
 
-        graph_runner = _init_vae_npu_graph_runner()
+        audio_vae = self.tts.audio_vae
+        graph_runner = _vae_npu_graph_runner_for(audio_vae)
         if graph_runner and feat.dim() == 3:
-            audio_vae = self.tts.audio_vae
             result = graph_runner.run(
                 "decode",
                 (feat, sr_cond),
