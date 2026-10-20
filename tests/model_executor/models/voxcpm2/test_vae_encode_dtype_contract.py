@@ -89,6 +89,14 @@ def test_prefill_inputs_accepts_wrapped_encode_features() -> None:
     assert audio_feat.dtype == torch.float32
 
     side_dtype = torch.float32
+    state = SimpleNamespace(
+        request_id="req",
+        prompt_cache={
+            "mode": "continuation",
+            "prompt_text": "",
+            "audio_feat": audio_feat,
+        },
+    )
     fake_self = SimpleNamespace(
         tts=SimpleNamespace(
             text_tokenizer=lambda text: [1, 2, 3],
@@ -97,21 +105,12 @@ def test_prefill_inputs_accepts_wrapped_encode_features() -> None:
         ),
         _patch_size=2,
         _side_dtype=side_dtype,
-        _active_states={
-            "req": SimpleNamespace(
-                prompt_cache={
-                    "mode": "continuation",
-                    "prompt_text": "",
-                    "audio_feat": audio_feat,
-                }
-            )
-        },
+        _active_states={"req": state},
     )
-
     # Pins the end-to-end contract: cache features produced through the
     # wrapped encode keep the fp32 dtype _build_prefill_inputs expects.
     result = VoxCPM2TalkerForConditionalGeneration._build_prefill_inputs(
-        fake_self, [10, 11], torch.device("cpu"), "req"
+        fake_self, [10, 11], torch.device("cpu"), state=state
     )
 
     assert result.audio_feat.dtype == side_dtype
