@@ -3671,12 +3671,15 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         model_state = getattr(self, "_mrv2_model_state", None)
         if model_state is not None and hidden_states.is_cuda:
-            # The MRV2 path decides stops via model_state directly; drain any
-            # pending stop-mask copies so their events/buffers are released
-            # instead of lingering until the states are dropped.
+            # The MRV2 path decides stops via model_state directly, but a
+            # pending stop-mask D2H may still carry an unresolved positive
+            # decision. RESOLVE it here (synchronize + latch into
+            # is_stopping) — build_stop_logits only forces the stop when
+            # state.is_stopping is already true (metadata mode 2) — rather
+            # than discarding the mask and silently dropping the stop.
             for state in self._active_states.values():
                 if state.pending_stop_mask_cpu is not None:
-                    self._discard_pending_stop_mask(state)
+                    self._should_stop_from_cached_logits(state)
             return model_state.build_stop_logits(hidden_states)
 
         bsz = hidden_states.shape[0]
