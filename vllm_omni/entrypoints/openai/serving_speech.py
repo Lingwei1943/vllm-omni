@@ -766,6 +766,73 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             output_tokens=usage_acc.total(),
         )
 
+    # VoxCPM2 badcase guard thresholds. Calibrated on Ascend NPU bench audio
+    # (4 rounds x 28 requests): normal speech is 0.13-0.48 s/char with full-clip
+    # RMS ~0.10; melodized ("singing") clips run 0.70-0.90 s/char at RMS ~0.02;
+    # runaway-silence clips are normal length at RMS ~0.001. Generated loudness
+    # otherwise varies up to ~17x clip-to-clip (0.006-0.10 RMS), which collapses
+    # perceived SNR ("hiss"/"background noise") — quiet-but-valid clips are
+    # loudness-normalized in place instead of rejected. The length-ratio
+    # criterion mirrors upstream VoxCPM2 retry_badcase (patches >= 6x text),
+    # tightened to the observed defect band.
+    _MING_BADCASE_MAX_S_PER_CHAR = 0.64
+    _MING_BADCASE_MARGIN_S = 0.4
+    _MING_BADCASE_MIN_S_PER_CHAR = 0.10
+    _MING_BADCASE_SILENCE_RMS = 0.004
+    _MING_BADCASE_TARGET_RMS = 0.09
+    _MING_BADCASE_PEAK_CEIL = 0.95
+
+    def _voxcpm2_badcase_guard(self, audio_tensor: Any, sample_rate: int, request: OpenAICreateSpeechRequest) -> None:
+        """Validate completed VoxCPM2 audio (non-streaming); normalize quiet clips.
+
+        Raises TTSGenerationError(retryable=True) for melodization, severe
+        truncation, and true silence so create_speech retries with a fresh seed
+        (matching upstream VoxCPM2 retry_badcase). Quiet-but-valid clips are
+        gain-normalized in place to a uniform loudness. Never applied to
+        streaming responses: chunks may already have been emitted, and failing
+        the stream would trade a bad-sounding success for a hard client error.
+        """
+        if os.environ.get("VLLM_OMNI_SPEECH_BADCASE_GUARD", "1") != "1":
+            return
+        audio = np.asarray(audio_tensor, dtype=np.float32).reshape(-1)
+        if audio.size == 0:
+            return
+        text = request.input or ""
+        cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+        if cjk < 2:
+            return
+        duration_s = audio.size / float(sample_rate or 48000)
+        rms = float(np.sqrt(np.mean(audio * audio))) if audio.size else 0.0
+        s_per_char = duration_s / cjk
+        reasons: list[str] = []
+        if duration_s > cjk * self._MING_BADCASE_MAX_S_PER_CHAR + self._MING_BADCASE_MARGIN_S:
+            reasons.append(f"melodization {s_per_char:.2f}s/char > {self._MING_BADCASE_MAX_S_PER_CHAR}")
+        if cjk >= 3 and duration_s < cjk * self._MING_BADCASE_MIN_S_PER_CHAR:
+            reasons.append(f"truncation {s_per_char:.2f}s/char < {self._MING_BADCASE_MIN_S_PER_CHAR}")
+        if rms < self._MING_BADCASE_SILENCE_RMS:
+            reasons.append(f"silence rms={rms:.4f} < {self._MING_BADCASE_SILENCE_RMS}")
+        if reasons:
+            logger.warning(
+                "VoxCPM2 badcase guard rejected audio for request: %.80s (%s); scheduling retry",
+                text,
+                "; ".join(reasons),
+            )
+            raise TTSGenerationError(
+                f"VoxCPM2 badcase detected ({'; '.join(reasons)}); retrying generation",
+                retryable=True,
+            )
+        if rms < self._MING_BADCASE_TARGET_RMS and rms > 0.0:
+            peak = float(np.abs(audio).max()) or 1.0
+            gain = min(self._MING_BADCASE_TARGET_RMS / rms, self._MING_BADCASE_PEAK_CEIL / peak)
+            if gain > 1.01:
+                audio *= gain
+                logger.info(
+                    "VoxCPM2 loudness normalized: rms %.4f -> %.4f (gain %.2f)",
+                    rms,
+                    rms * gain,
+                    gain,
+                )
+
     @staticmethod
     def _build_speech_usage_headers(usage: SpeechTokenUsage | None) -> dict[str, str]:
         """Map speech usage into non-streaming response headers.
@@ -828,6 +895,40 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         info = self.uploaded_speakers.get(voice_lower)
         return int(info.get("created_at", 0)) if info else 0
 
+    def _get_default_voxcpm2_ref(self) -> tuple[list[float], int] | None:
+        """Env-configured default reference audio for zero-shot anchoring.
+
+        VoxCPM2 zero-shot (no reference) free-runs accent/prosody, which
+        surfaces as dialect-feel drift and melodic ("singing") renders. A
+        pinned default reference (a clean, human-verified clip + transcript)
+        anchors every request that does not carry its own reference audio.
+        Loaded once and cached for the process lifetime.
+        """
+        path = os.environ.get("VLLM_OMNI_SPEECH_DEFAULT_REF_WAV")
+        if not path:
+            return None
+        cached = getattr(self, "_default_voxcpm2_ref_cache", None)
+        if cached is not None:
+            return cached
+        try:
+            import wave as _wave
+
+            with _wave.open(path, "rb") as w:
+                sr = w.getframerate()
+                x = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+            cached = (x.tolist(), sr)
+            logger.info(
+                "Default VoxCPM2 reference audio loaded: %s (%.2fs @%dHz) — zero-shot anchoring enabled",
+                path,
+                len(cached[0]) / sr,
+                sr,
+            )
+        except Exception as exc:
+            logger.warning("Failed to load default ref audio %s: %s", path, exc)
+            cached = None
+        self._default_voxcpm2_ref_cache = cached
+        return cached
+
     async def _build_voxcpm2_prompt(
         self,
         request: OpenAICreateSpeechRequest,
@@ -845,6 +946,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         ref_audio = None
         ref_sr = None
         voice_profile = None
+        ref_text = request.ref_text
         if request.ref_audio is not None:
             ref_audio, ref_sr, _ = await self._resolve_ref_audio(request.ref_audio)
         elif uploaded_ref is not None:
@@ -852,16 +954,33 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             ref_audio = wav_np.tolist()
         elif request.voice is not None:
             voice_profile = self._adapter.capabilities.precomputed_speakers.get(request.voice.lower())
-        return build_voxcpm2_prompt(
+        injected_default_ref = False
+        if ref_audio is None and voice_profile is None:
+            default_ref = self._get_default_voxcpm2_ref()
+            if default_ref is not None:
+                ref_audio, ref_sr = default_ref
+                ref_text = ref_text or os.environ.get("VLLM_OMNI_SPEECH_DEFAULT_REF_TEXT") or None
+                injected_default_ref = True
+        prompt = build_voxcpm2_prompt(
             hf_config=self.engine_client.model_config.hf_config,
             tokenizer=self._voxcpm2_tokenizer,
             split_map=self._voxcpm2_split_map,
             text=request.input,
             ref_audio=ref_audio,
             ref_sr=ref_sr,
-            ref_text=request.ref_text,
+            ref_text=ref_text,
             voice_profile=voice_profile,
         )
+        if injected_default_ref:
+            # Tag the request with a stable speaker-cache key so the talker
+            # stores the built reference cache after the first request and
+            # later requests skip the per-request reference encode. Must be set
+            # post-build: build_voxcpm2_prompt constructs additional_information
+            # itself.
+            additional = prompt.setdefault("additional_information", {})
+            additional["voice_name"] = "default_ref_anchor"
+            additional["voice_created_at"] = 0
+        return prompt
 
     def _load_uploaded_audio(self, voice_name: str) -> tuple[np.ndarray, int] | None:
         """Load decoded audio samples + sample rate from an uploaded voice's safetensors."""
@@ -2211,6 +2330,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         prev_count = 0
         sample_rate_val = 24000
         first_chunk = True
+        # Initial burst buffering: hold the first (N-1) audio chunks and emit
+        # them together with chunk N. The client's playback clock then starts
+        # with N chunks of reserve, absorbing the per-arrival prefill-tail
+        # block (~100-500ms) that a shared GPU serializes ahead of decode —
+        # without it, in-flight streams underrun on every mixed step.
+        burst_n = max(1, int(os.environ.get("VLLM_OMNI_SPEECH_INITIAL_BURST", "1")))
+        burst_buf: list[bytes] = []
+        burst_released = burst_n <= 1
         first_audio_chunk_s: float | None = None
         stream_start_s = request_start_s if request_start_s is not None else time.perf_counter()
         artifact_ready = False
@@ -2291,10 +2418,30 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     if first_audio_chunk_s is None:
                         first_audio_chunk_s = time.perf_counter()
                     audio_bytes = self.create_audio(audio_obj).audio_data
+                    if not burst_released:
+                        burst_buf.append(audio_bytes)
+                        if len(burst_buf) >= burst_n:
+                            for held in burst_buf:
+                                if include_sample_rate:
+                                    yield held, sample_rate_val
+                                else:
+                                    yield held
+                            burst_buf.clear()
+                            burst_released = True
+                        continue
                     if include_sample_rate:
                         yield audio_bytes, sample_rate_val
                     else:
                         yield audio_bytes
+            if burst_buf:
+                # Request finished with held chunks (burst never reached N —
+                # short generation); flush so the tail is never truncated.
+                for held in burst_buf:
+                    if include_sample_rate:
+                        yield held, sample_rate_val
+                    else:
+                        yield held
+                burst_buf.clear()
             if self._tts_model_type in _AUDEX_NO_AUDIO_GUARD_MODEL_TYPES and first_audio_chunk_s is None:
                 # Audex contract: zero codec tokens must abort the stream, not
                 # complete it cleanly with zero audio bytes.
@@ -3186,6 +3333,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         usage_out: list[SpeechTokenUsage] | None = None,
         has_inline_ref_audio: bool | None = None,
         collect: dict | None = None,
+        badcase_check: bool = True,
     ) -> tuple[bytes | str, str]:
         # ``usage_out`` is an opt-in output channel: when a list is passed, the
         # computed SpeechTokenUsage is appended to it. The return stays a
@@ -3319,6 +3467,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 # Audex contract: zero codec tokens must fail the request, not
                 # serialize as an empty-but-successful WAV.
                 raise ValueError("Audex produced no audio (the thinker emitted zero or invalid codec tokens)")
+
+            # VoxCPM2 badcase guard (non-streaming only): mirrors upstream
+            # VoxCPM2's retry_badcase, which vLLM-Omni's streaming integration
+            # does not inherit. Detects melodization (audio far longer than the
+            # text warrants), runaway silence, and severe truncation, and
+            # rejects the generation so create_speech retries with a fresh seed.
+            if badcase_check and self._tts_model_type == "voxcpm2":
+                self._voxcpm2_badcase_guard(audio_tensor, sample_rate, request)
 
             audio_obj = CreateAudio(
                 audio_tensor=audio_tensor,
@@ -3550,6 +3706,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             )
 
         try:
+            logger.info(
+                "BENCHDBG model=%s voice=%s input=%r stream=%s fmt=%s fmt_raw=%s nsm=%s tt=%s maxnt=%s hdrs=%s",
+                request.model,
+                request.voice,
+                (request.input or "")[:16],
+                request.stream,
+                request.stream_format,
+                getattr(raw_request, "headers", {}).get("content-type", "?") if raw_request else "?",
+                request.non_streaming_mode,
+                request.task_type,
+                request.max_new_tokens,
+                {k: v for k, v in (getattr(raw_request, "headers", {}) or {}).items()
+                 if k.lower() in ("x-request-id", "authorization", "user-agent")},
+            )
             if request.is_streaming() and request.word_timestamps:
                 return self.create_error_response(
                     "word_timestamps=true is currently supported by the WebSocket "
@@ -3636,6 +3806,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     request_id=retry_request_id,
                     usage_out=usage_box,
                     collect=collect,
+                    # Last attempt is accepted as-is (upstream retry_badcase
+                    # semantics): a second consecutive badcase would otherwise
+                    # hard-fail the request instead of returning best-effort
+                    # audio.
+                    badcase_check=False,
                 )
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
             logger.info(

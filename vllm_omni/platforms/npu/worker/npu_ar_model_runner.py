@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import copy
 from dataclasses import replace
 from typing import Any, NamedTuple
@@ -49,6 +49,7 @@ from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async
 from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
+from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
@@ -254,7 +255,9 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
             hs_for_cache = hidden_states if self._model_needs_full_prefix_hidden_states() else None
             slot_mapping_gpu = self.input_batch.block_table[0].slot_mapping.gpu
-            slot_mapping_cpu = slot_mapping_gpu[:num_tokens_padded].cpu()
+            slot_mapping_slice = slot_mapping_gpu[:num_tokens_padded]
+            slot_mapping_cpu = torch.empty(slot_mapping_slice.shape, dtype=slot_mapping_slice.dtype, pin_memory=True)
+            slot_mapping_cpu.copy_(slot_mapping_slice, non_blocking=True)
             self.omni_prefix_cache.update_omni_tensor_prefix_cache(
                 hidden_states=hs_for_cache,
                 multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
@@ -385,6 +388,106 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         return bool(value)
     #  -------------------------------------- Omni-new -------------------------------------------------
 
+    def _get_runner_assisted_full_attention_metadata_request(
+        self,
+        *,
+        req_ids: Sequence[str],
+        num_reqs: int,
+        num_reqs_padded: int,
+        num_scheduled_tokens_np: np.ndarray,
+        num_computed_tokens_cpu: torch.Tensor | np.ndarray,
+        max_num_scheduled_tokens: int,
+    ) -> RunnerAssistedFullAttentionMetadataRequest | None:
+        # Mirrors gpu_ar_model_runner: VoxCPM2 uses this hook to ask the runner
+        # for padded FULL attention metadata while keeping graph policy and
+        # lifecycle in the model layer.
+        hook = getattr(self.model, "get_runner_assisted_full_attention_metadata_request", None)
+        if not callable(hook):
+            return None
+        num_computed_tokens = num_computed_tokens_cpu
+        if hasattr(num_computed_tokens, "numpy"):
+            num_computed_tokens = num_computed_tokens.numpy()
+        request = hook(
+            req_ids=req_ids,
+            num_reqs=num_reqs,
+            num_scheduled_tokens=num_scheduled_tokens_np[:num_reqs],
+            num_computed_tokens=num_computed_tokens,
+            max_num_scheduled_tokens=max_num_scheduled_tokens,
+        )
+        if request is None:
+            return None
+        if not isinstance(request, RunnerAssistedFullAttentionMetadataRequest):
+            raise TypeError(
+                "runner-assisted full attention metadata hook must return "
+                "RunnerAssistedFullAttentionMetadataRequest or None, got "
+                f"{type(request).__name__}"
+            )
+        padded_num_reqs = max(
+            num_reqs_padded,
+            min(int(request.num_reqs_padded), self.scheduler_config.max_num_seqs),
+        )
+        return RunnerAssistedFullAttentionMetadataRequest(
+            num_reqs_padded=padded_num_reqs,
+            for_cudagraph_capture=bool(request.for_cudagraph_capture),
+        )
+
+    def _refresh_runner_assisted_full_attention_metadata_buffers(
+        self,
+        *,
+        num_reqs: int,
+        num_reqs_padded: int,
+        num_scheduled_tokens_np: np.ndarray,
+    ) -> None:
+        num_computed_tokens = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+        if hasattr(num_computed_tokens, "numpy"):
+            num_computed_tokens = num_computed_tokens.numpy()
+        np.add(
+            num_computed_tokens,
+            num_scheduled_tokens_np,
+            out=self.optimistic_seq_lens_cpu[:num_reqs].numpy(),
+        )
+        # Padding rows are dummy one-token requests (mirrors
+        # _pad_query_start_loc_for_fia's dummy semantics): a positive KV
+        # length is what the FIA param update expects; 0 could be rejected.
+        self.optimistic_seq_lens_cpu[num_reqs:num_reqs_padded].fill_(1)
+        self.seq_lens.copy_(self.optimistic_seq_lens_cpu, non_blocking=True)
+
+        cum_num_tokens = self._get_cumsum_and_arange(
+            num_scheduled_tokens_np,
+            self.query_pos.np,
+        )
+        self.query_start_loc.np[0] = 0
+        self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
+        # Padding rows carry INCREMENTING cumulative offsets ending at the
+        # bucket's token count. The FIA TND constraint requires the last
+        # entry of actual_seq_lengths_q (derived from this buffer) to equal
+        # hidden_states.shape[0]; filling the pad range with cum[-1] (the
+        # real token count) registers the attention ops under the real
+        # count and breaks the task-group consistency at capture_end
+        # (NPU error 107033).
+        last_loc = int(cum_num_tokens[-1])
+        self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1] = (
+            self.arange_np[1 : num_reqs_padded + 1 - num_reqs] + last_loc
+        )
+        self.query_start_loc.copy_to_gpu()
+
+        self.input_batch.block_table.commit_block_table(num_reqs_padded)
+
+    def _set_runner_assisted_full_attention_metadata_context(
+        self,
+        *,
+        enabled: bool,
+        num_reqs: int = 0,
+    ) -> bool:
+        hook = getattr(self.model, "set_runner_assisted_full_attention_metadata_context", None)
+        if not callable(hook):
+            return False
+        hook(
+            enabled=enabled,
+            num_reqs=num_reqs,
+        )
+        return True
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -404,6 +507,8 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 self._execution_start_time = time.perf_counter()
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
+        runner_assisted_full_attn = False
+        runner_assisted_full_attn_capture = False
 
         #  -------------------------------------- Omni-new -------------------------------------------------
         # [Omni] Handle KV transfer BEFORE updating states (which removes finished requests)
@@ -589,6 +694,20 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
                 num_tokens_padded = batch_desc.num_tokens
                 num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
+
+                runner_assisted_full_attn_request = self._get_runner_assisted_full_attention_metadata_request(
+                    req_ids=req_ids[:num_reqs],
+                    num_reqs=num_reqs,
+                    num_reqs_padded=num_reqs_padded,
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                    num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                    max_num_scheduled_tokens=max_num_scheduled_tokens,
+                )
+                if runner_assisted_full_attn_request is not None:
+                    num_reqs_padded = runner_assisted_full_attn_request.num_reqs_padded
+                    runner_assisted_full_attn_capture = runner_assisted_full_attn_request.for_cudagraph_capture
+                    num_tokens_padded = max(num_tokens_padded, num_reqs_padded * max_num_scheduled_tokens)
+                runner_assisted_full_attn = runner_assisted_full_attn_request is not None
                 ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
                     should_ubatch,
                     num_scheduled_tokens_np,
@@ -646,11 +765,16 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
-                if (
+                if not runner_assisted_full_attn and (
                     cudagraph_mode == CUDAGraphMode.FULL
                     or (enable_sp() and not self.model_config.use_mla)
                     and self.dcp_size == 1
                 ):
+                    # runner-assisted batches skip this: the function would
+                    # overwrite num_reqs_padded with batch_desc/num_reqs (it
+                    # does not know about the assist's bucket padding), and
+                    # the refreshed query_start_loc below already satisfies
+                    # the FIA TND constraint (last cumulative == row count).
                     # Currently, Graph Mode and SP will both pad num_tokens,
                     # Another possible condition is num_tokens_padded != num_tokens_unpadded
                     # but this scope is way too big and the consequences are unpredictable
@@ -663,10 +787,26 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         batch_desc.num_reqs,
                     )
 
+                if runner_assisted_full_attn:
+                    logger.info(
+                        "RALOG nr=%d nrp=%d ntp=%d capture=%s batch_desc_nr=%s",
+                        num_reqs,
+                        num_reqs_padded,
+                        num_tokens_padded,
+                        runner_assisted_full_attn_capture,
+                        getattr(batch_desc, "num_reqs", None),
+                    )
+                    self._refresh_runner_assisted_full_attention_metadata_buffers(
+                        num_reqs=num_reqs,
+                        num_reqs_padded=num_reqs_padded,
+                        num_scheduled_tokens_np=num_scheduled_tokens_np,
+                    )
+
+                attn_num_reqs = num_reqs_padded if runner_assisted_full_attn else num_reqs
                 (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded,
-                    num_reqs=num_reqs,
+                    num_reqs=attn_num_reqs,
                     num_reqs_padded=num_reqs_padded,
                     max_query_len=max_num_scheduled_tokens,
                     ubatch_slices=ubatch_slices_attn,
@@ -675,6 +815,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                    for_cudagraph_capture=runner_assisted_full_attn_capture,
                 )
 
             (
@@ -719,33 +860,50 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         defer_kv_connector_finalize = self.speculative_config is not None and (
             get_pp_group().is_last_rank or self.broadcast_pp_output
         )
-        with (
-            record_function_or_nullcontext("forward"),
-            set_ascend_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                aclgraph_runtime_mode=cudagraph_mode,
-                batch_descriptor=batch_desc,
-                num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
-                model_instance=self.model,
-                skip_compiled=has_encoder_input,
-                has_sinks=self._has_sinks,
-                eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
-            ),
-            self.maybe_get_kv_connector_output(
-                scheduler_output,
-                **(
-                    {"defer_finalize": defer_kv_connector_finalize}
-                ),
-            ) as kv_connector_output,
-        ):
-            if self.cache_config.mamba_cache_mode == "align":
-                mamba_utils.do_mamba_copy_block(preprocess_bufs)
-            hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+        runner_assisted_context_enabled = False
+        if runner_assisted_full_attn:
+            runner_assisted_context_enabled = self._set_runner_assisted_full_attention_metadata_context(
+                enabled=True,
+                num_reqs=num_reqs,
             )
+            runner_assisted_full_attn = runner_assisted_context_enabled
+        # The model replays its own internal NPU graph for these steps (the
+        # unified decode graph); keep the engine-side aclgraph machinery out
+        # so the two graph layers never nest.
+        unified_takes_over = runner_assisted_full_attn
+        try:
+            with (
+                record_function_or_nullcontext("forward"),
+                set_ascend_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    aclgraph_runtime_mode=(
+                        CUDAGraphMode.NONE if unified_takes_over else cudagraph_mode
+                    ),
+                    batch_descriptor=batch_desc,
+                    num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
+                    model_instance=self.model,
+                    skip_compiled=has_encoder_input or unified_takes_over,
+                    has_sinks=self._has_sinks,
+                    eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
+                ),
+                self.maybe_get_kv_connector_output(
+                    scheduler_output,
+                    **(
+                        {"defer_finalize": defer_kv_connector_finalize}
+                    ),
+                ) as kv_connector_output,
+            ):
+                if self.cache_config.mamba_cache_mode == "align":
+                    mamba_utils.do_mamba_copy_block(preprocess_bufs)
+                hidden_states = self._model_forward(
+                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                )
+        finally:
+            if runner_assisted_context_enabled:
+                self._set_runner_assisted_full_attention_metadata_context(enabled=False)
         with record_function_or_nullcontext("post process"):
             #  -------------------------------------- Omni-new -------------------------------------------------
             # [Omni] Map pending ropes metadata to req_ids.

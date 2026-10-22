@@ -718,7 +718,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             # _compute_slot_mapping_kernel which only writes to .gpu). We must use .gpu and
             # sync back to CPU to get the correctly computed slot mapping.
             slot_mapping_gpu = self.input_batch.block_table[0].slot_mapping.gpu
-            slot_mapping_cpu = slot_mapping_gpu[:num_tokens_padded].cpu()
+            slot_mapping_gpu = self.input_batch.block_table[0].slot_mapping.gpu
+            slot_mapping_slice = slot_mapping_gpu[:num_tokens_padded]
+            slot_mapping_cpu = torch.empty(slot_mapping_slice.shape, dtype=slot_mapping_slice.dtype, pin_memory=True)
+            slot_mapping_cpu.copy_(slot_mapping_slice, non_blocking=True)
             self.omni_prefix_cache.update_omni_tensor_prefix_cache(
                 hidden_states=hs_for_cache,
                 multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,

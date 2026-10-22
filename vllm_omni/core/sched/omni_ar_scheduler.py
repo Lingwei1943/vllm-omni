@@ -534,6 +534,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if new_token_ids:
                 num_sampled_tokens = len(new_token_ids)
                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
+                logger.info(
+                    "TOKUPD req=%s tokens=%s stopped=%s eos=%s status=%s",
+                    req_id,
+                    new_token_ids[:6],
+                    stopped,
+                    request.sampling_params.eos_token_id,
+                    request.status,
+                )
                 if new_logprobs is not None and len(new_token_ids) < num_sampled_tokens:
                     # A mid-step stop (e.g. spec-decode tokens sampled past
                     # EOS) trims new_token_ids after the validation slice
