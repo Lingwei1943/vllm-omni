@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """VoxCPM2 serving adapter (AR base-LM + diffusion side-computation)."""
 
+import os
 import time
 from typing import Any
 
@@ -99,8 +100,20 @@ class VoxCPM2Adapter(ARTTSAdapter):
             stream=False,
             model=server.model_name,
         )
+        # Anchor-pool pre-warm: each pool anchor pays a one-time reference
+        # encode on its first request; cycling the warmup N times (N = pool
+        # size) moves all encodes to startup so live requests always hit the
+        # speaker cache.
+        pool_dir = os.environ.get("VLLM_OMNI_SPEECH_ANCHOR_POOL")
+        pool_size = 1
+        if pool_dir and os.path.isdir(pool_dir):
+            pool_size = max(1, len([n for n in os.listdir(pool_dir) if n.lower().endswith(".wav")]))
+            logger.info("Anchor pool detected: %d clip(s); pre-warming each", pool_size)
         try:
-            _audio_bytes, _media_type = await server._generate_audio_bytes(warmup_req, request_id="speech-warmup")
+            for i in range(pool_size):
+                _audio_bytes, _media_type = await server._generate_audio_bytes(
+                    warmup_req, request_id=f"speech-warmup-{i}"
+                )
         except Exception as exc:
             logger.warning("Speech warmup failed (non-fatal): %s", exc)
             return

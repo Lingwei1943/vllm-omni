@@ -903,7 +903,49 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         pinned default reference (a clean, human-verified clip + transcript)
         anchors every request that does not carry its own reference audio.
         Loaded once and cached for the process lifetime.
+
+        Anchor-pool mode: when VLLM_OMNI_SPEECH_ANCHOR_POOL points at a
+        directory of screened anchor WAVs, requests without their own
+        reference are anchored round-robin across the pool, giving per-request
+        voice variety at anchored quality. Takes precedence over the
+        single-clip VLLM_OMNI_SPEECH_DEFAULT_REF_WAV.
         """
+        pool_dir = os.environ.get("VLLM_OMNI_SPEECH_ANCHOR_POOL")
+        if pool_dir:
+            cached = getattr(self, "_anchor_pool_cache", None)
+            if cached is None:
+                cached = []
+                try:
+                    for name in sorted(os.listdir(pool_dir)):
+                        if not name.lower().endswith(".wav"):
+                            continue
+                        try:
+                            import wave as _wave
+
+                            with _wave.open(os.path.join(pool_dir, name), "rb") as w:
+                                sr = w.getframerate()
+                                x = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(
+                                    np.float32
+                                ) / 32768.0
+                            cached.append((name, x.tolist(), sr))
+                        except Exception as exc:
+                            logger.warning("Anchor pool: skipping %s: %s", name, exc)
+                except Exception as exc:
+                    logger.warning("Anchor pool dir %s unreadable: %s", pool_dir, exc)
+                logger.info("Anchor pool loaded: %d clip(s) from %s (round-robin)", len(cached), pool_dir)
+                self._anchor_pool_cache = cached
+                self._anchor_pool_idx = 0
+            if cached:
+                name, samples, sr = cached[self._anchor_pool_idx % len(cached)]
+                idx = self._anchor_pool_idx % len(cached)
+                self._anchor_pool_idx += 1
+                logger.debug("Anchor pool: using %s", name)
+                # Distinct cache key per pool member: a shared key would let
+                # one member's built prompt cache satisfy another's request
+                # (wrong voice + prefill-length mismatch).
+                self._default_ref_cache_key = f"default_ref_anchor_{idx}_{name}"
+                return (samples, sr)
+            return None
         path = os.environ.get("VLLM_OMNI_SPEECH_DEFAULT_REF_WAV")
         if not path:
             return None
@@ -927,6 +969,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             logger.warning("Failed to load default ref audio %s: %s", path, exc)
             cached = None
         self._default_voxcpm2_ref_cache = cached
+        self._default_ref_cache_key = "default_ref_anchor"
         return cached
 
     async def _build_voxcpm2_prompt(
@@ -972,13 +1015,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             voice_profile=voice_profile,
         )
         if injected_default_ref:
-            # Tag the request with a stable speaker-cache key so the talker
-            # stores the built reference cache after the first request and
-            # later requests skip the per-request reference encode. Must be set
-            # post-build: build_voxcpm2_prompt constructs additional_information
-            # itself.
+            # Tag the request with a stable per-anchor speaker-cache key so the
+            # talker stores the built reference cache after the first request
+            # and later requests skip the per-request reference encode. Must be
+            # set post-build: build_voxcpm2_prompt constructs
+            # additional_information itself.
             additional = prompt.setdefault("additional_information", {})
-            additional["voice_name"] = "default_ref_anchor"
+            additional["voice_name"] = getattr(self, "_default_ref_cache_key", "default_ref_anchor")
             additional["voice_created_at"] = 0
         return prompt
 
