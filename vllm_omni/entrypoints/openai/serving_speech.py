@@ -77,6 +77,27 @@ from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
+# Edge digit-run prosody pad: VoxCPM2's zero-shot acoustic stream starts
+# cold, and the first/last text token of an utterance can be voiced weakly
+# or dropped entirely — most severe for short digit tokens (e.g. the
+# "<i>{text}<i>" file-index wrapping used in TTS test harnesses). A
+# prosodic break (，) adjacent to a short edge digit-run gives the digit a
+# neighbouring token to anchor its voicing. Digit runs longer than 2
+# (2024年) or followed by non-CJK (15.3%) are left untouched.
+_VOXCPM2_LEADING_DIGIT_RUN_RE = re.compile(r"^(\d{1,2})(?=[\u4e00-\u9fff])")
+_VOXCPM2_TRAILING_DIGIT_RUN_RE = re.compile(r"([\u4e00-\u9fff。！？，、；：])(\d{1,2})$")
+
+
+def _pad_voxcpm2_edge_digit_runs(text: str) -> str:
+    if not text:
+        return text
+    m = _VOXCPM2_LEADING_DIGIT_RUN_RE.match(text)
+    if m:
+        text = f"{text[: m.end(1)]}，{text[m.end(1):]}"
+    if _VOXCPM2_TRAILING_DIGIT_RUN_RE.search(text):
+        text = f"{text}，"
+    return text
+
 logger = init_logger(__name__)
 
 
@@ -990,6 +1011,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         ref_sr = None
         voice_profile = None
         ref_text = request.ref_text
+        # Blank ref_text must degrade to None: with prompt_text="" the talker
+        # skips the prompt-audio cache entirely (falsy check) while the serving
+        # prefill length still counts the reference patches -> chunked-prefill
+        # length assertion -> EngineCore fatal crash for all in-flight requests.
+        if isinstance(ref_text, str) and not ref_text.strip():
+            ref_text = None
         if request.ref_audio is not None:
             ref_audio, ref_sr, _ = await self._resolve_ref_audio(request.ref_audio)
         elif uploaded_ref is not None:
@@ -1008,7 +1035,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             hf_config=self.engine_client.model_config.hf_config,
             tokenizer=self._voxcpm2_tokenizer,
             split_map=self._voxcpm2_split_map,
-            text=request.input,
+            text=_pad_voxcpm2_edge_digit_runs(request.input),
             ref_audio=ref_audio,
             ref_sr=ref_sr,
             ref_text=ref_text,
