@@ -21,6 +21,7 @@ from collections.abc import Callable, Iterable, Sequence
 from types import MethodType
 from typing import Any, NamedTuple, Protocol, TypedDict
 
+import numpy as np
 import torch
 import torch.nn as nn
 from typing_extensions import Unpack
@@ -332,6 +333,8 @@ class _RequestState:
     # character's tail (heard as "last char half-eaten"). Requiring 2
     # consecutive votes costs +1 patch latency and fixes the truncation.
     stop_vote: int = 0
+    # RMS of the first emitted audio chunk (diagnostics: cold-start analysis).
+    first_patch_rms: float = 0.0
     # Upstream VoxCPM2 badcase guard: bound the generated patch count at
     # text_len * retry_badcase_ratio_threshold + 10 so a melodized/humming
     # generation cannot run away (mirrors voxcpm.model._generate_with_prompt_cache).
@@ -1077,6 +1080,12 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         # Consecutive stop-head votes required before a request stops (tail
         # truncation guard: the first vote can land mid-phoneme).
         self._stop_vote_threshold = int(os.environ.get("VLLM_OMNI_SPEECH_STOP_VOTE_THRESHOLD", "2"))
+        # Soft limiter for VAE output transients (cold-stream pops); 0 disables.
+        self._soft_limit_enabled = os.environ.get("VLLM_OMNI_SPEECH_SOFT_LIMIT", "1") != "0"
+        # VAE self-warm start: first decode pads with copies of its own latent
+        # so the decoder receptive field sees a steady signal (fixes the
+        # damped/muffled utterance onset); 0 disables.
+        self._vae_warm_start = os.environ.get("VLLM_OMNI_SPEECH_VAE_WARM_START", "1") != "0"
         self._max_batch_size = getattr(vllm_config.scheduler_config, "max_num_seqs", 4)
 
         # Speaker cache for ref_audio_feat across requests
@@ -1217,6 +1226,20 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
     def _cleanup_request(self, request_id: str) -> None:
         state = self._active_states.pop(request_id, None)
         if state is not None:
+            # RQFIN 诊断：请求终态（解码步数/文本token/墙钟/流内RTF近似）。
+            # 用途：步数分布形状、steps/token 离散度、完成时刻聚集性。
+            if os.environ.get("VLLM_OMNI_SPEECH_STEPDIAG") == "1" and logger.isEnabledFor(20):
+                _wall = time.time() - state.request_start_time if state.request_start_time else 0.0
+                _tt = getattr(state, "text_tokens", 0)
+                logger.info(
+                    "RQFIN req=%s steps=%d text_tokens=%d wall_s=%.2f sps=%.2f first_rms=%.4f",
+                    request_id,
+                    state.decode_step_count,
+                    _tt,
+                    _wall,
+                    state.decode_step_count / max(_tt, 1),
+                    getattr(state, "first_patch_rms", 0.0),
+                )
             state.pending_audio_chunks_gpu.clear()
             state.pending_audio_copies.clear()
             state.pending_vae_latents_gpu.clear()
@@ -2209,6 +2232,17 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._perf.stop("unified.replay")
 
         self._perf.start("unified.commit")
+        # BTCHD 诊断：批内各请求已解码步数极差（量化混合步阻塞强度）。
+        if os.environ.get("VLLM_OMNI_SPEECH_STEPDIAG") == "1" and logger.isEnabledFor(20):
+            _ds = [getattr(s, "decode_step_count", 0) for s in states]
+            if _ds:
+                logger.info(
+                    "BTCHD bs=%d stepmin=%d stepmax=%d range=%d",
+                    num_reqs,
+                    min(_ds),
+                    max(_ds),
+                    max(_ds) - min(_ds),
+                )
         # CFM + feature encoding OUTSIDE the graph: the estimator's serving
         # path (compiled + its own NPU graph) keeps the AR numerics identical
         # to the eager baseline. Mirrors _finish_decode_batch's batched path.
@@ -3267,6 +3301,15 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         else:
             vae_input = new_latent
             pad_frames = 0
+            # VAE cold decode: the first patch has no left context, so the
+            # decoder's receptive field sees zeros and the utterance onset
+            # comes out damped/muffled. Self-pad with copies of the first
+            # latent so the receptive field sees a steady signal; the sliced
+            # output below discards the pad region.
+            if self._vae_warm_start and n_new < self._n_decode_pad_frames:
+                _pad = new_latent[-1:].expand(self._n_decode_pad_frames - n_new, -1)
+                vae_input = torch.cat([_pad, new_latent], dim=0)
+                pad_frames = _pad.shape[0]
 
         # VAE decode: (1, feat_dim, T_frames) -> (1, 1, T_samples)
         with _NvtxRange("voxcpm2.vae_prepare"):
@@ -3281,11 +3324,28 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         with _NvtxRange("voxcpm2.vae_slice"):
             dcs = int(getattr(self.tts.audio_vae, "decode_chunk_size", audio.numel() // vae_frames))
             new_audio = audio[pad_frames * dcs : (pad_frames + n_new) * dcs]
+            # Soft-limit VAE transients: cold-stream pops exceed full scale and
+            # clamp harshly at int16 conversion. Gentle knee (0.92, slope 0.05)
+            # rounds the spike; unconditional elementwise ops keep the decode
+            # loop free of host synchronization.
+            if self._soft_limit_enabled:
+                _lim = 0.92
+                _abs = new_audio.abs()
+                new_audio = torch.where(
+                    _abs > _lim,
+                    torch.sign(new_audio) * (_lim + (_abs - _lim) * 0.05),
+                    new_audio,
+                )
 
         # Roll the pad buffer: keep last N latent frames as context for next step.
         with _NvtxRange("voxcpm2.vae_pad_update"):
             all_latents = vae_input  # [pad + new]
             state.decode_pad = all_latents[-self._n_decode_pad_frames :].detach()
+
+        # First-chunk RMS capture for cold-start diagnostics (one host sync
+        # per request, not per chunk).
+        if state.first_patch_rms == 0.0 and new_audio.numel():
+            state.first_patch_rms = float(new_audio.pow(2).mean().sqrt().item())
 
         self._perf.stop("vae_decode")
         if self._enable_delayed_audio_copy and self._audio_emit_every == 1:
@@ -3587,7 +3647,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 state.decode_step_count = 0
                 # text_token_ids is the target text (BOS already stripped above);
                 # upstream retry_badcase clamps max_len at text_len*6+10 patches.
-                state.max_audio_patches = len(token_ids) * 6 + 10 if token_ids else 0
+                # VLLM_OMNI_SPEECH_PATCH_CAP=0 disables the cap (attribution use).
+                _cap = int(os.environ.get("VLLM_OMNI_SPEECH_PATCH_CAP", "1"))
+                state.max_audio_patches = len(token_ids) * 6 + 10 if (token_ids and _cap) else 0
+                # 诊断插桩：记录目标文本 token 数（steps/token 比的分母）
+                state.text_tokens = len(token_ids)
                 state.precomputed_stop_logits = None
                 state.precomputed_is_stopping = None
                 self._discard_pending_stop_mask(state)
@@ -3649,11 +3713,52 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 )
 
             if state.prompt_cache is None and (ref_audio or (prompt_audio and prompt_text)):
-                state.prompt_cache = self._build_prompt_cache(
-                    ref_audio=ref_audio,
-                    prompt_audio=prompt_audio,
-                    prompt_text=prompt_text,
-                )
+                # Content-hash cache for reference encoding: benchmark datasets
+                # (Seed-TTS et al.) reuse the same prompt WAV across many rows,
+                # and every re-encode is a GPU-blocking VAE pass inside prefill
+                # that spikes ITL for co-decoding streams. Cache the built
+                # prompt cache keyed by cheap content signature.
+                _sig = None
+                for _ra in (ref_audio, prompt_audio):
+                    _is_raw = (
+                        isinstance(_ra, (list, tuple))
+                        and len(_ra) == 2
+                        and isinstance(_ra[1], int)
+                        and isinstance(_ra[0], (list, torch.Tensor))
+                    )
+                    if _is_raw:
+                        _samples = _ra[0]
+                        try:
+                            import hashlib as _hl
+
+                            _arr = (
+                                np.asarray(_samples, dtype=np.float32)
+                                if not isinstance(_samples, torch.Tensor)
+                                else _samples.detach().float().cpu().numpy()
+                            )
+                            _sig = _hl.md5(_arr.tobytes()).hexdigest()[:16]
+                        except Exception:
+                            _sig = None
+                        if _sig:
+                            _key = f"refenc_{_sig}"
+                            _cached = self._speaker_cache.get(_key)
+                            if _cached is not None and "mode" in _cached:
+                                state.prompt_cache = self._clone_prompt_cache(_cached)
+                                logger.debug("Ref-encode cache HIT for %s", _key)
+                                break
+                if state.prompt_cache is None:
+                    state.prompt_cache = self._build_prompt_cache(
+                        ref_audio=ref_audio,
+                        prompt_audio=prompt_audio,
+                        prompt_text=prompt_text,
+                    )
+                    if state.prompt_cache is not None and _sig:
+                        _key = f"refenc_{_sig}"
+                        self._speaker_cache.put(
+                            _key,
+                            {k: (v.cpu() if isinstance(v, torch.Tensor) else v) for k, v in state.prompt_cache.items()},
+                        )
+                        logger.debug("Ref-encode cache STORE for %s", _key)
                 if (
                     voice_name
                     and state.prompt_cache is not None

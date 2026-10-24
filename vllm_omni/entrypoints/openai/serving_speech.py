@@ -98,6 +98,49 @@ def _pad_voxcpm2_edge_digit_runs(text: str) -> str:
         text = f"{text}，"
     return text
 
+
+# Full text frontend = edge pad -> text normalization. The native VoxCPM2
+# pipeline normalizes text (digits -> Chinese numerals, e.g. 48 -> 四十八)
+# before the model ever sees it; our serving path previously sent raw digit
+# tokens, which the model reads digit-by-digit (48 -> 四八) and voices
+# unreliably at utterance edges. Pad first so the prosodic break survives
+# conversion (the pad regex matches raw digits), then normalize.
+_VOXCPM2_TN_TRIGGER_RE = re.compile(r"[\d$%^*+=<>√≈²³]")
+_VOXCPM2_EDGE_ZERO_RE = re.compile(r"(?<!\d)0，")
+_VOXCPM2_ZERO_SENTINEL = "\uee00"
+_VOXCPM2_NORMALIZER = None
+
+
+def _voxcpm2_text_frontend(text: str) -> str:
+    if os.environ.get("VLLM_OMNI_SPEECH_EDGE_PAD", "1") != "0":
+        text = _pad_voxcpm2_edge_digit_runs(text)
+    if os.environ.get("VLLM_OMNI_SPEECH_TEXT_NORMALIZE", "1") == "0":
+        return text
+    if not text or not _VOXCPM2_TN_TRIGGER_RE.search(text):
+        return text
+    global _VOXCPM2_NORMALIZER
+    if _VOXCPM2_NORMALIZER is None:
+        try:
+            from voxcpm.utils.text_normalize import TextNormalizer
+
+            _VOXCPM2_NORMALIZER = TextNormalizer()
+        except Exception as exc:
+            logger.warning("VoxCPM2 TextNormalizer unavailable, TN disabled: %s", exc)
+            _VOXCPM2_NORMALIZER = False
+    if _VOXCPM2_NORMALIZER is False:
+        return text
+    try:
+        # The padded edge digit '0' voices fine as a raw digit token ("0，" ->
+        # "líng, ..."), but its normalized form 零 is swallowed by the
+        # cold-start pause at both edges; guard lone edge '0，' out of
+        # conversion (the lookbehind keeps 10，/100， intact).
+        protected = _VOXCPM2_EDGE_ZERO_RE.sub(f"{_VOXCPM2_ZERO_SENTINEL}，", text)
+        normalized = _VOXCPM2_NORMALIZER.normalize(protected)
+        return normalized.replace(f"{_VOXCPM2_ZERO_SENTINEL}，", "0，")
+    except Exception as exc:
+        logger.warning("VoxCPM2 text normalization failed, using raw text: %s", exc)
+        return text
+
 logger = init_logger(__name__)
 
 
@@ -1035,7 +1078,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             hf_config=self.engine_client.model_config.hf_config,
             tokenizer=self._voxcpm2_tokenizer,
             split_map=self._voxcpm2_split_map,
-            text=_pad_voxcpm2_edge_digit_runs(request.input),
+            text=_voxcpm2_text_frontend(request.input),
             ref_audio=ref_audio,
             ref_sr=ref_sr,
             ref_text=ref_text,
