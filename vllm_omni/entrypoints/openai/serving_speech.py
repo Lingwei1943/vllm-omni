@@ -77,69 +77,68 @@ from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
-# Edge digit-run prosody pad: VoxCPM2's zero-shot acoustic stream starts
-# cold, and the first/last text token of an utterance can be voiced weakly
-# or dropped entirely — most severe for short digit tokens (e.g. the
-# "<i>{text}<i>" file-index wrapping used in TTS test harnesses). A
-# prosodic break (，) adjacent to a short edge digit-run gives the digit a
-# neighbouring token to anchor its voicing. Digit runs longer than 2
-# (2024年) or followed by non-CJK (15.3%) are left untouched.
+# VoxCPM2 zero-shot text frontend.
+#
+# Root cause chain (controlled attribution, see notes 续9/续10): the
+# zero-shot acoustic stream starts cold, and a leading/ending text token
+# whose fused form ("▁X") is absent from the tokenizer vocab gets absorbed
+# by the model's cold-start pause — worst for short numeral syllables.
+# Fused forms exist for ▁一/▁二/▁三/▁四/▁五/▁七 (and common chars) but not
+# for ▁零/▁六/▁八/▁九/▁十/▁两. The native VoxCPM2 pipeline additionally
+# runs text normalization (digits -> Chinese numerals) which our serving
+# path lacked, so raw digit tokens were read digit-by-digit (48 -> 四八).
+#
+# Frontend order (all steps verified individually):
+#   1. exactly "10" at an edge -> 一十: fused ▁一 lead reads reliably as
+#      yī-shí (lone 十 does not voice).
+#   2. prosodic break (，) after/before every edge digit-run: THE STABILITY
+#      ANCHOR. Under concurrent streaming, numeral-led prompts WITHOUT the
+#      break generate quiet (rms ~0.018 vs 0.106) and 9-15% dead-silent
+#      renders; with the break both vanish. Breaks also give the cold
+#      start a neighbor for the digit's voicing. TN preserves the break.
+#   3. lone edge '0' held out of TN via a sentinel: normalized 零 is
+#      swallowed at both edges, 〇 misreads under load; the raw digit
+#      token gives a weak-but-right-syllable líng.
+#   4. TextNormalizer (digits -> numerals, 48 -> 四十八).
+_VOXCPM2_ZERO_SENTINEL = "\uee00"
+_VOXCPM2_LEAD_TEN_RE = re.compile(r"^10(?=[\u4e00-\u9fff])")
+_VOXCPM2_TRAIL_TEN_RE = re.compile(r"(?<![\d.])10$")
 _VOXCPM2_LEADING_DIGIT_RUN_RE = re.compile(r"^(\d{1,2})(?=[\u4e00-\u9fff])")
 _VOXCPM2_TRAILING_DIGIT_RUN_RE = re.compile(r"([\u4e00-\u9fff。！？，、；：])(\d{1,2})$")
-
-
-def _pad_voxcpm2_edge_digit_runs(text: str) -> str:
-    if not text:
-        return text
-    m = _VOXCPM2_LEADING_DIGIT_RUN_RE.match(text)
-    if m:
-        text = f"{text[: m.end(1)]}，{text[m.end(1):]}"
-    if _VOXCPM2_TRAILING_DIGIT_RUN_RE.search(text):
-        text = f"{text}，"
-    return text
-
-
-# Full text frontend = edge pad -> text normalization. The native VoxCPM2
-# pipeline normalizes text (digits -> Chinese numerals, e.g. 48 -> 四十八)
-# before the model ever sees it; our serving path previously sent raw digit
-# tokens, which the model reads digit-by-digit (48 -> 四八) and voices
-# unreliably at utterance edges. Pad first so the prosodic break survives
-# conversion (the pad regex matches raw digits), then normalize.
 _VOXCPM2_TN_TRIGGER_RE = re.compile(r"[\d$%^*+=<>√≈²³]")
-_VOXCPM2_EDGE_ZERO_RE = re.compile(r"(?<!\d)0，")
-_VOXCPM2_ZERO_SENTINEL = "\uee00"
 _VOXCPM2_NORMALIZER = None
 
 
 def _voxcpm2_text_frontend(text: str) -> str:
+    if not text:
+        return text
     if os.environ.get("VLLM_OMNI_SPEECH_EDGE_PAD", "1") != "0":
-        text = _pad_voxcpm2_edge_digit_runs(text)
-    if os.environ.get("VLLM_OMNI_SPEECH_TEXT_NORMALIZE", "1") == "0":
-        return text
-    if not text or not _VOXCPM2_TN_TRIGGER_RE.search(text):
-        return text
-    global _VOXCPM2_NORMALIZER
-    if _VOXCPM2_NORMALIZER is None:
-        try:
-            from voxcpm.utils.text_normalize import TextNormalizer
+        text = _VOXCPM2_LEAD_TEN_RE.sub("一十，", text)
+        text = _VOXCPM2_TRAIL_TEN_RE.sub("一十，", text)
+        text = _VOXCPM2_LEADING_DIGIT_RUN_RE.sub(r"\1，", text)
+        text = _VOXCPM2_TRAILING_DIGIT_RUN_RE.sub(r"\1\2，", text)
+        # hold lone edge '0' (now followed by our break) out of TN conversion
+        if text.startswith("0，"):
+            text = _VOXCPM2_ZERO_SENTINEL + text[1:]
+        if text.endswith("0，"):
+            text = text[:-2] + _VOXCPM2_ZERO_SENTINEL + "，"
+    if os.environ.get("VLLM_OMNI_SPEECH_TEXT_NORMALIZE", "1") != "0" and _VOXCPM2_TN_TRIGGER_RE.search(text):
+        global _VOXCPM2_NORMALIZER
+        if _VOXCPM2_NORMALIZER is None:
+            try:
+                from voxcpm.utils.text_normalize import TextNormalizer
 
-            _VOXCPM2_NORMALIZER = TextNormalizer()
-        except Exception as exc:
-            logger.warning("VoxCPM2 TextNormalizer unavailable, TN disabled: %s", exc)
-            _VOXCPM2_NORMALIZER = False
-    if _VOXCPM2_NORMALIZER is False:
-        return text
-    try:
-        # The padded edge digit '0' voices fine as a raw digit token ("0，" ->
-        # "líng, ..."), but its normalized form 零 is swallowed by the
-        # cold-start pause at both edges; guard lone edge '0，' out of
-        # conversion (the lookbehind keeps 10，/100， intact).
-        protected = _VOXCPM2_EDGE_ZERO_RE.sub(f"{_VOXCPM2_ZERO_SENTINEL}，", text)
-        normalized = _VOXCPM2_NORMALIZER.normalize(protected)
-        return normalized.replace(f"{_VOXCPM2_ZERO_SENTINEL}，", "0，")
-    except Exception as exc:
-        logger.warning("VoxCPM2 text normalization failed, using raw text: %s", exc)
-        return text
+                _VOXCPM2_NORMALIZER = TextNormalizer()
+            except Exception as exc:
+                logger.warning("VoxCPM2 TextNormalizer unavailable, TN disabled: %s", exc)
+                _VOXCPM2_NORMALIZER = False
+        if _VOXCPM2_NORMALIZER is not False:
+            try:
+                text = _VOXCPM2_NORMALIZER.normalize(text)
+            except Exception as exc:
+                logger.warning("VoxCPM2 text normalization failed, using raw text: %s", exc)
+    text = text.replace(_VOXCPM2_ZERO_SENTINEL, "0")
+    return text
 
 logger = init_logger(__name__)
 
