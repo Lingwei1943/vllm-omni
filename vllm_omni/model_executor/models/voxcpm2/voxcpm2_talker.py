@@ -335,6 +335,9 @@ class _RequestState:
     stop_vote: int = 0
     # RMS of the first emitted audio chunk (diagnostics: cold-start analysis).
     first_patch_rms: float = 0.0
+    # Head-trim bookkeeping: leading near-silent patches skipped so far.
+    head_trimmed: bool = False
+    head_skip_count: int = 0
     # Upstream VoxCPM2 badcase guard: bound the generated patch count at
     # text_len * retry_badcase_ratio_threshold + 10 so a melodized/humming
     # generation cannot run away (mirrors voxcpm.model._generate_with_prompt_cache).
@@ -1086,6 +1089,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         # so the decoder receptive field sees a steady signal (fixes the
         # damped/muffled utterance onset); 0 disables.
         self._vae_warm_start = os.environ.get("VLLM_OMNI_SPEECH_VAE_WARM_START", "1") != "0"
+        # Head trim: skip emitting leading near-silent patches (cold lead-in);
+        # 0 disables.
+        self._head_trim_enabled = os.environ.get("VLLM_OMNI_SPEECH_HEAD_TRIM", "1") != "0"
+        self._head_trim_rms = float(os.environ.get("VLLM_OMNI_SPEECH_HEAD_TRIM_RMS", "0.02"))
+        self._head_trim_max = int(os.environ.get("VLLM_OMNI_SPEECH_HEAD_TRIM_MAX_PATCHES", "8"))
         self._max_batch_size = getattr(vllm_config.scheduler_config, "max_num_seqs", 4)
 
         # Speaker cache for ref_audio_feat across requests
@@ -3346,6 +3354,19 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         # per request, not per chunk).
         if state.first_patch_rms == 0.0 and new_audio.numel():
             state.first_patch_rms = float(new_audio.pow(2).mean().sqrt().item())
+
+        # Head trim: the acoustic stream opens with a dead lead-in patch
+        # (most generations start with a zero chunk) that can carry
+        # cold-start noise textures heard as clicks/spring-like artifacts.
+        # Skip emitting leading near-silent patches until the first audible
+        # one, bounded, so streaming and non-streaming both start at the
+        # speech onset. Patch-granularity keeps onsets intact.
+        if self._head_trim_enabled and not state.head_trimmed and new_audio.numel():
+            _rms = float(new_audio.pow(2).mean().sqrt().item())
+            state.head_skip_count += 1
+            if _rms < self._head_trim_rms and state.head_skip_count <= self._head_trim_max:
+                return None
+            state.head_trimmed = True
 
         self._perf.stop("vae_decode")
         if self._enable_delayed_audio_copy and self._audio_emit_every == 1:

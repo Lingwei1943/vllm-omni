@@ -10,6 +10,7 @@ import math
 import os
 import re
 import struct
+import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -139,6 +140,110 @@ def _voxcpm2_text_frontend(text: str) -> str:
                 logger.warning("VoxCPM2 text normalization failed, using raw text: %s", exc)
     text = text.replace(_VOXCPM2_ZERO_SENTINEL, "0")
     return text
+
+
+# --- Tail trim (official post-processing advice, VoxCPM#132: trim leading
+# and trailing silence with a simple algorithm). Conservative: only cuts
+# when there is a long trailing near-silent stretch, keeping a natural
+# 0.2s tail; never touches samples above the floor (weak trailing digits
+# are preserved).
+_VOXCPM2_TAIL_TRIM_FLOOR = 0.01
+_VOXCPM2_TAIL_TRIM_KEEP_S = 0.2
+_VOXCPM2_TAIL_TRIM_MIN_CUT_S = 0.3
+
+
+def _qc_to_numpy(audio_tensor: Any) -> np.ndarray:
+    if hasattr(audio_tensor, "detach"):
+        return audio_tensor.detach().cpu().float().reshape(-1)
+    return np.asarray(audio_tensor, dtype=np.float32).reshape(-1)
+
+
+def _voxcpm2_trim_tail_silence(audio_tensor: torch.Tensor, sample_rate: int) -> torch.Tensor:
+    x = _qc_to_numpy(audio_tensor)
+    n = x.shape[0]
+    if n < int(0.5 * sample_rate):
+        return audio_tensor
+    loud = np.nonzero(np.abs(x) > _VOXCPM2_TAIL_TRIM_FLOOR)[0]
+    if loud.size == 0:
+        return audio_tensor
+    cut = int(loud[-1]) + int(_VOXCPM2_TAIL_TRIM_KEEP_S * sample_rate)
+    if n - cut > int(_VOXCPM2_TAIL_TRIM_MIN_CUT_S * sample_rate):
+        return x[:cut]
+    return audio_tensor
+
+
+# --- ASR content QC (non-streaming; mirrors the production-fork practice of
+# bad-case detection with limited retries + ASR regression baseline,
+# VoxCPM#352/#381). Catches content-class defects the DSP guard cannot see
+# (dropped/mispronounced/inserted characters). On failure raises a retryable
+# TTSGenerationError so the existing outer retry regenerates with a fresh
+# seed; the retry itself runs with badcase_check=False (QC off) so it
+# terminates after at most two generations.
+_VOXCPM2_ASR_QC_CER = float(os.environ.get("VLLM_OMNI_SPEECH_ASR_QC_CER", "0.18"))
+
+
+def _qc_strip(s: str) -> str:
+    return "".join(c for c in s if c.isalnum() or "\u4e00" <= c <= "\u9fff").lower()
+
+
+def _qc_cer(ref: str, hyp: str) -> float:
+    r, h = _qc_strip(ref), _qc_strip(hyp)
+    if not r:
+        return 0.0 if not h else 1.0
+    prev = list(range(len(h) + 1))
+    for i, rc in enumerate(r, 1):
+        cur = [i] + [0] * len(h)
+        for j, hc in enumerate(h, 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (rc != hc))
+        prev = cur
+    return prev[-1] / max(len(r), 1)
+
+
+class _SpeechASRQC:
+    """Lazy singleton SenseVoice transcriber, serialized by a lock."""
+
+    def __init__(self) -> None:
+        self._model = None
+        self._lock = threading.Lock()
+
+    def _ensure(self):
+        if self._model is None:
+            import warnings
+
+            warnings.filterwarnings("ignore")
+            from funasr import AutoModel
+
+            self._model = AutoModel(model="iic/SenseVoiceSmall", trust_remote_code=True, disable_update=True)
+        return self._model
+
+    def transcribe(self, audio_tensor: Any, sample_rate: int) -> str:
+        import tempfile
+        import wave as _wave
+
+        x = _qc_to_numpy(audio_tensor).clip(-1.0, 1.0)
+        with self._lock:
+            m = self._ensure()
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                path = tmp.name
+            try:
+                w = _wave.open(path, "wb")
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(sample_rate)
+                w.writeframes((x * 32767.0).astype(np.int16).tobytes())
+                w.close()
+                res = m.generate(input=path, cache={}, language="auto", use_itn=True, batch_size=1)
+                from funasr.utils.postprocess_utils import rich_transcription_postprocess
+
+                return rich_transcription_postprocess(res[0]["text"])
+            finally:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+
+_ASR_QC = _SpeechASRQC()
 
 logger = init_logger(__name__)
 
@@ -957,6 +1062,42 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """
         info = self.uploaded_speakers.get(voice_lower)
         return int(info.get("created_at", 0)) if info else 0
+
+    async def _voxcpm2_asr_content_qc(
+        self, audio_tensor: Any, sample_rate: int, request: OpenAICreateSpeechRequest
+    ) -> None:
+        """ASR-in-the-loop content QC for completed VoxCPM2 audio (non-streaming).
+
+        Transcribes the generated audio with SenseVoice and compares it with
+        the requested text (normalized character error rate). Content-class
+        defects the DSP guard cannot see (dropped / mispronounced / inserted
+        characters, melodized gibberish) raise a retryable TTSGenerationError,
+        reusing the existing fresh-seed retry. Disabled on retries via
+        badcase_check=False so at most two generations occur.
+        """
+        if os.environ.get("VLLM_OMNI_SPEECH_ASR_QC", "1") != "1":
+            return
+        expected = request.input or ""
+        if len(_qc_strip(expected)) < 4:
+            return
+        try:
+            from vllm.utils.async_utils import make_async
+
+            heard = await make_async(_ASR_QC.transcribe)(audio_tensor, sample_rate)
+        except Exception as exc:
+            logger.warning("ASR QC unavailable, skipping: %s", exc)
+            return
+        err = _qc_cer(expected, heard)
+        # Length-delta criterion: single-character drops/insertions keep CER
+        # under threshold (1/12 ≈ 0.08) but shift the spoken length; homophone
+        # substitutions keep length, so the two criteria are complementary.
+        _len_delta = abs(len(_qc_strip(expected)) - len(_qc_strip(heard))) / max(len(_qc_strip(expected)), 1)
+        logger.info("ASR QC cer=%.2f len_d=%.2f expected=%r heard=%r", err, _len_delta, expected[:24], heard[:24])
+        if err > _VOXCPM2_ASR_QC_CER or _len_delta > 0.08:
+            raise TTSGenerationError(
+                f"VoxCPM2 ASR content QC failed (cer={err:.2f} len_delta={_len_delta:.2f})",
+                retryable=True,
+            )
 
     def _get_default_voxcpm2_ref(self) -> tuple[list[float], int] | None:
         """Env-configured default reference audio for zero-shot anchoring.
@@ -3587,6 +3728,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # rejects the generation so create_speech retries with a fresh seed.
             if badcase_check and self._tts_model_type == "voxcpm2":
                 self._voxcpm2_badcase_guard(audio_tensor, sample_rate, request)
+                audio_tensor = _voxcpm2_trim_tail_silence(audio_tensor, sample_rate)
+                await self._voxcpm2_asr_content_qc(audio_tensor, sample_rate, request)
 
             audio_obj = CreateAudio(
                 audio_tensor=audio_tensor,
