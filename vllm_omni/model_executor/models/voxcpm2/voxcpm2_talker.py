@@ -3298,6 +3298,14 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         ):
             return
 
+        # If a previous batch's copy is still in flight, sync it up front —
+        # an empty-pending early return below must not skip this wait, or the
+        # in-flight copy can land in pinned pages the allocator has reused.
+        prev_event = getattr(self, "_pending_stop_mask_event", None)
+        if prev_event is not None:
+            prev_event.synchronize()
+            self._pending_stop_mask_event = None
+
         pending: list[tuple[_RequestState, torch.Tensor]] = []
         for state in states:
             if state.is_stopping or state.precomputed_is_stopping is not None:
@@ -3317,14 +3325,6 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             stacked = torch.stack([stop_logits[0] for _, stop_logits in pending], dim=0)
 
         device_module = torch.get_device_module(current_omni_platform.get_torch_device())
-
-        # If a previous batch's copy is still in flight (a consumer was
-        # cleared without reading), sync it before replacing the single-slot
-        # device source below, or the stale copy could read freed memory.
-        prev_event = getattr(self, "_pending_stop_mask_event", None)
-        if prev_event is not None:
-            prev_event.synchronize()
-            self._pending_stop_mask_event = None
 
         # Compute the mask and stage the D2H copy on a dedicated side stream:
         # the compute stream (VAE decode etc.) never queues behind the copy,
