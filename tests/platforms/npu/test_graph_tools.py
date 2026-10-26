@@ -521,6 +521,8 @@ def _install_fake_npu(monkeypatch, *, with_pool_handle: bool = True):
         "graph": graph_context,
         "synchronize": synchronize,
         "is_current_stream_capturing": lambda: False,
+        # _vae_npu_graph_runner_for flips this before constructing a runner.
+        "config": SimpleNamespace(allow_internal_format=True),
     }
     if with_pool_handle:
         npu_members["graph_pool_handle"] = lambda: next(handles)
@@ -627,6 +629,7 @@ def test_vae_npu_graph_runner_is_per_instance(monkeypatch):
 
     runner_a = talker_module._vae_npu_graph_runner_for(vae_a)
     runner_b = talker_module._vae_npu_graph_runner_for(vae_b)
+    assert torch.npu.config.allow_internal_format is False
 
     assert runner_a is not runner_b, "each AudioVAE instance must own its runner"
     assert runner_a is not False and runner_b is not False

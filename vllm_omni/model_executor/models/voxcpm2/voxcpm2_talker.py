@@ -62,7 +62,10 @@ logger = init_logger(__name__)
 
 _ENABLE_NVTX_PROFILE = False
 
-_VAE_NPU_GRAPH_RUNNER_LOCK = threading.Lock()
+# RLock: _disable_npu_internal_format_once acquires this same lock, and the
+# first VAE decode calls it from inside _vae_npu_graph_runner_for's critical
+# section. threading.Lock is not reentrant and deadlocks that path.
+_VAE_NPU_GRAPH_RUNNER_LOCK = threading.RLock()
 _NPU_INTERNAL_FORMAT_MUTATED = False
 
 
