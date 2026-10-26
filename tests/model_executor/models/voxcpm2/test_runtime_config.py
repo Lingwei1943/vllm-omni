@@ -18,7 +18,7 @@ def test_runner_specific_audio_defaults(uses_v2):
         SimpleNamespace(model_config=SimpleNamespace(use_v2_model_runner=uses_v2))
     )
     assert config.enable_incremental_vae is uses_v2
-    assert config.vae_decode_every == (1 if uses_v2 else 3)
+    assert config.vae_decode_every == (1 if uses_v2 else 2)
     assert config.audio_emit_every == (3 if uses_v2 else 1)
 
 
