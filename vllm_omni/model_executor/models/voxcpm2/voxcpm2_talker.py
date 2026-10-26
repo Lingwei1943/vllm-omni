@@ -1786,7 +1786,10 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         feat = feat.to(dtype=self._vae_dtype)
         sr_cond = self._get_vae_decode_sr_cond(feat.device)
         if not self._enable_vae_cuda_graph:
-            return self.tts.audio_vae.decode(feat, sr_cond=sr_cond)
+            # fp32 PCM boundary: decode_ready_slots / make_audio_output copy_
+            # this waveform into the fp32 audio_buffer; a bf16 return raises
+            # there on the non-per-patch MRV2 path under a bf16 deployment.
+            return self.tts.audio_vae.decode(feat, sr_cond=sr_cond).float()
 
         graph_key = (feat.shape[0], feat.shape[-1])
         graph = self._vae_graphs.get(graph_key)
@@ -1796,7 +1799,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         graph.input_feat.copy_(feat)
         graph.graph.replay()
-        return graph.output
+        return graph.output.float()
 
     def _capture_cfm_graph(
         self,
@@ -3441,10 +3444,10 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._clear_state_tensor(state, "last_audio_patch_gpu")
 
         # patch shape: (patch_size, feat_dim) or (1, patch_size, feat_dim)
-        # Keep the latent in the VAE's configured dtype: the MRV2 per-patch
-        # path decodes through model_state.decode_patch, which must not
-        # bypass this alignment (weights are _vae_dtype after the cast).
-        new_latent = patch.reshape(-1, self._feat_dim).to(self._vae_dtype)
+        # Keep latents fp32: they feed append_pending_latent / store_decode_pad
+        # which copy_ into fp32 pending_latents / decode_pad, and the VAE
+        # decode casts to the deployment dtype itself in _run_vae_decode.
+        new_latent = patch.reshape(-1, self._feat_dim).to(torch.float32)
         model_state = getattr(self, "_mrv2_model_state", None)
         if model_state is not None and model_state.per_patch_audio:
             indices = model_state.indices_for([state])

@@ -312,7 +312,10 @@ class VoxCPM2ModelState(OmniModelState):
             return pcm.reshape(len(slots), -1).float(), valid
         lengths = self.latent_context_lengths.index_select(0, slots)
         context = self.latent_context.index_select(0, slots)
-        inputs, tail, next_lengths = pack_patch_context(context, lengths, patch)
+        # Pack against the fp32 context (pack_patch_context torch.where's the
+        # context against this patch — a bf16 patch there raises under
+        # --dtype bfloat16); cast only the tensor that enters audio_vae.decode.
+        inputs, tail, next_lengths = pack_patch_context(context, lengths, patch.float())
         sr_cond = self.model._get_vae_decode_sr_cond(inputs.device)
         decoded = self.model.tts.audio_vae.decode(inputs.to(vae_dtype), sr_cond=sr_cond).reshape(len(slots), -1)
         samples = self.model._patch_size * int(self.model.tts.audio_vae.decode_chunk_size)
