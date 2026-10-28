@@ -1099,7 +1099,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 retryable=True,
             )
 
-    def _get_default_voxcpm2_ref(self) -> tuple[list[float], int] | None:
+    def _get_default_voxcpm2_ref(self) -> tuple[list[float], int, str] | None:
         """Env-configured default reference audio for zero-shot anchoring.
 
         VoxCPM2 zero-shot (no reference) free-runs accent/prosody, which
@@ -1107,6 +1107,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         pinned default reference (a clean, human-verified clip + transcript)
         anchors every request that does not carry its own reference audio.
         Loaded once and cached for the process lifetime.
+
+        Returns (samples, sample_rate, speaker_cache_key). The cache key MUST
+        travel inside the request, never on an instance attribute: concurrent
+        requests interleave between the key assignment and its consumption,
+        and a shared attribute cross-assigns pool members' cache keys
+        (wrong reference conditioning + prefill-length mismatch).
 
         Anchor-pool mode: when VLLM_OMNI_SPEECH_ANCHOR_POOL points at a
         directory of screened anchor WAVs, requests without their own
@@ -1146,9 +1152,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 logger.debug("Anchor pool: using %s", name)
                 # Distinct cache key per pool member: a shared key would let
                 # one member's built prompt cache satisfy another's request
-                # (wrong voice + prefill-length mismatch).
-                self._default_ref_cache_key = f"default_ref_anchor_{idx}_{name}"
-                return (samples, sr)
+                # (wrong voice + prefill-length mismatch). Returned per-request
+                # instead of stored on self (async key race).
+                return (samples, sr, f"default_ref_anchor_{idx}_{name}")
             return None
         path = os.environ.get("VLLM_OMNI_SPEECH_DEFAULT_REF_WAV")
         if not path:
@@ -1173,8 +1179,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             logger.warning("Failed to load default ref audio %s: %s", path, exc)
             cached = None
         self._default_voxcpm2_ref_cache = cached
-        self._default_ref_cache_key = "default_ref_anchor"
-        return cached
+        return (cached[0], cached[1], "default_ref_anchor")
 
     async def _build_voxcpm2_prompt(
         self,
@@ -1208,10 +1213,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         elif request.voice is not None:
             voice_profile = self._adapter.capabilities.precomputed_speakers.get(request.voice.lower())
         injected_default_ref = False
+        default_ref_key = None
         if ref_audio is None and voice_profile is None:
             default_ref = self._get_default_voxcpm2_ref()
             if default_ref is not None:
-                ref_audio, ref_sr = default_ref
+                ref_audio, ref_sr, default_ref_key = default_ref
                 ref_text = ref_text or os.environ.get("VLLM_OMNI_SPEECH_DEFAULT_REF_TEXT") or None
                 injected_default_ref = True
         prompt = build_voxcpm2_prompt(
@@ -1224,15 +1230,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             ref_text=ref_text,
             voice_profile=voice_profile,
         )
-        if injected_default_ref:
-            # Tag the request with a stable per-anchor speaker-cache key so the
-            # talker stores the built reference cache after the first request
-            # and later requests skip the per-request reference encode. Must be
-            # set post-build: build_voxcpm2_prompt constructs
-            # additional_information itself.
-            additional = prompt.setdefault("additional_information", {})
-            additional["voice_name"] = getattr(self, "_default_ref_cache_key", "default_ref_anchor")
-            additional["voice_created_at"] = 0
+        # NOTE: injected references intentionally carry NO voice_name tag.
+        # The talker-side voice_name cache path restores cached reference
+        # conditioning that degrades renders when text varies across a
+        # rotating pool (measured: ~14% doubling/garble vs 0% via the
+        # content-hash refenc path on identical members/texts/stress). Without
+        # the tag the talker takes the refenc (md5 content-hash) cache path,
+        # which caches the same encode with clean behavior.
         return prompt
 
     def _load_uploaded_audio(self, voice_name: str) -> tuple[np.ndarray, int] | None:
