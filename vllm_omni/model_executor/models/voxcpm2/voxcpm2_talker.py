@@ -3332,18 +3332,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         with _NvtxRange("voxcpm2.vae_slice"):
             dcs = int(getattr(self.tts.audio_vae, "decode_chunk_size", audio.numel() // vae_frames))
             new_audio = audio[pad_frames * dcs : (pad_frames + n_new) * dcs]
-            # Soft-limit VAE transients: cold-stream pops exceed full scale and
-            # clamp harshly at int16 conversion. Gentle knee (0.92, slope 0.05)
-            # rounds the spike; unconditional elementwise ops keep the decode
-            # loop free of host synchronization.
-            if self._soft_limit_enabled:
-                _lim = 0.92
-                _abs = new_audio.abs()
-                new_audio = torch.where(
-                    _abs > _lim,
-                    torch.sign(new_audio) * (_lim + (_abs - _lim) * 0.05),
-                    new_audio,
-                )
+            new_audio = self._apply_soft_limit(new_audio)
 
         # Roll the pad buffer: keep last N latent frames as context for next step.
         with _NvtxRange("voxcpm2.vae_pad_update"):
@@ -3396,6 +3385,39 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 audio_chunk = audio_chunk.clone()
             return audio_chunk
         return new_audio.detach().cpu().float()
+
+    def _apply_soft_limit(self, new_audio: torch.Tensor) -> torch.Tensor:
+        """Asymptotic soft clip shared by per-step and batched VAE decode paths.
+
+        Below the knee the signal is untouched; above it, tanh compresses toward
+        a 0.97 ceiling so the int16 conversion can never hard-clip (the source of
+        harsh broken onsets on hot pool-clone renders). Normal speech peaks sit
+        at 0.5-0.85 and pass through unchanged.
+        """
+        if not self._soft_limit_enabled:
+            return new_audio
+        _knee = 0.90
+        _abs = new_audio.abs()
+        return torch.where(
+            _abs > _knee,
+            torch.sign(new_audio) * (_knee + (0.97 - _knee) * torch.tanh((_abs - _knee) / (0.97 - _knee))),
+            new_audio,
+        )
+
+    def _head_trim_should_skip(self, state: _RequestState, new_audio: torch.Tensor) -> bool:
+        """True when this leading patch is near-silent and should not be emitted.
+
+        Shared by per-step and batched decode paths; mutates the request state's
+        trim counters exactly once per call.
+        """
+        if not self._head_trim_enabled or state.head_trimmed or not new_audio.numel():
+            return False
+        _rms = float(new_audio.pow(2).mean().sqrt().item())
+        state.head_skip_count += 1
+        if _rms < self._head_trim_rms and state.head_skip_count <= self._head_trim_max:
+            return True
+        state.head_trimmed = True
+        return False
 
     def _can_collect_audio_batch(
         self,
@@ -3474,6 +3496,15 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 with _NvtxRange("voxcpm2.vae_slice"):
                     dcs = int(getattr(self.tts.audio_vae, "decode_chunk_size", audio.numel() // vae_frames))
                     new_audio = audio[pad_frames * dcs : (pad_frames + n_new) * dcs]
+                    new_audio = self._apply_soft_limit(new_audio)
+
+                # Keep the batched path's output invariants identical to the
+                # per-step path: no int16 clipping, no cold-start lead-in.
+                if self._head_trim_should_skip(state, new_audio):
+                    outputs[state.request_id] = None
+                    continue
+                if state.first_patch_rms == 0.0 and new_audio.numel():
+                    state.first_patch_rms = float(new_audio.pow(2).mean().sqrt().item())
 
                 with _NvtxRange("voxcpm2.vae_pad_update"):
                     state.decode_pad = vae_input[-self._n_decode_pad_frames :].detach()
