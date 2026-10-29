@@ -93,6 +93,10 @@ def _get_vae_npu_graph_runner():
 
 _ENABLE_NVTX_PROFILE = False
 
+# CFG-Zero★ projection + first-step skip: solver approximation (defaults on).
+# VLLM_OMNI_SPEECH_CFG_ZERO_STAR=0 restores the textbook CFG solver numerics.
+_USE_CFG_ZERO_STAR = os.environ.get("VLLM_OMNI_SPEECH_CFG_ZERO_STAR", "1") != "0"
+
 
 def _remove_weight_norm_from_module(module: nn.Module) -> None:
     """Recursively remove weight_norm from all submodules.
@@ -806,7 +810,7 @@ def _optimized_solve_euler(
     n_timesteps: int,
     cfg_value: float,
     buffers: _CFMBufferManager,
-    use_cfg_zero_star: bool = True,
+    use_cfg_zero_star: bool = _USE_CFG_ZERO_STAR,
     cfg_cutoff_ratio: float = 1.0,
     perf: _PerfTimer | None = None,
 ) -> torch.Tensor:
@@ -836,7 +840,7 @@ def _optimized_solve_euler_with_noise(
     n_timesteps: int,
     cfg_value: float,
     buffers: _CFMBufferManager,
-    use_cfg_zero_star: bool = True,
+    use_cfg_zero_star: bool = _USE_CFG_ZERO_STAR,
     cfg_cutoff_ratio: float = 1.0,
     perf: _PerfTimer | None = None,
 ) -> torch.Tensor:
@@ -938,7 +942,7 @@ def _solve_euler_full_cfm(
     n_timesteps: int,
     cfg_value: float,
     buffers: _CFMBufferManager,
-    use_cfg_zero_star: bool = True,
+    use_cfg_zero_star: bool = _USE_CFG_ZERO_STAR,
     cfg_cutoff_ratio: float = 1.0,
     perf: _PerfTimer | None = None,
 ) -> torch.Tensor:
@@ -1062,6 +1066,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         # stability + cfg_value for singing/run-away generations
         # (OpenBMB/VoxCPM#136, #216). Default matches upstream (2.0).
         self._cfg_value = float(os.environ.get("VLLM_OMNI_SPEECH_CFG_VALUE", "2.0"))
+        # CFG-Zero★ projection + first-step skip: perf/quality approximation.
+        # Set VLLM_OMNI_SPEECH_CFG_ZERO_STAR=0 for the textbook CFG solver
+        # (matches the native package's numerics; zero-init skip is tied to
+        # this flag). Suspected source of broadband render-fire hiss.
+        self._use_cfg_zero_star = os.environ.get("VLLM_OMNI_SPEECH_CFG_ZERO_STAR", "1") != "0"
         self._cfg_cutoff_ratio = self._runtime_config.cfg_cutoff_ratio
         # Number of trailing latent frames to keep as VAE receptive-field context
         # for sliding-window streaming decode. 12 matches the nanovllm reference
