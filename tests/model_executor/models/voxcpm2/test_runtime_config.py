@@ -41,6 +41,9 @@ class _FakeOmniPlatform:
 def test_runner_specific_audio_defaults(monkeypatch, uses_v2, is_cuda, expected):
     # Incremental VAE is a CUDA-only per-patch feature: CUDA v2 gets the MRV2
     # audio profile (1/3); every other combination keeps the v1 cadence (2/1).
+    # The base deploy yaml no longer pins the audio cadence keys, so the
+    # (2, 1) dataclass defaults ARE the shipped v1 behavior — changing them
+    # silently changes every deployment that does not pin the keys itself.
     import vllm_omni.platforms as platforms_mod
 
     monkeypatch.setattr(platforms_mod, "current_omni_platform", _FakeOmniPlatform(is_cuda))
@@ -65,9 +68,8 @@ def test_mrv2_explicit_legacy_audio_override():
     assert config.audio_emit_every == 1
 
 
-def _runtime_config_from_deploy_yaml(name: str, use_v2_model_runner: bool) -> _VoxCPM2RuntimeConfig:
-    deploy_dir = Path(vllm_omni.__file__).resolve().parent / "deploy"
-    merged = resolve_deploy_yaml(deploy_dir / name)
+def _runtime_config_from_deploy_yaml(yaml_path: Path, use_v2_model_runner: bool) -> _VoxCPM2RuntimeConfig:
+    merged = resolve_deploy_yaml(yaml_path)
     runtime_dict = next(
         stage["engine_extras"]["hf_overrides"]["voxcpm2_runtime_config"]
         for stage in merged["stages"]
@@ -83,11 +85,12 @@ def _runtime_config_from_deploy_yaml(name: str, use_v2_model_runner: bool) -> _V
 def test_deploy_yaml_resolves_effective_audio_defaults():
     # The base yaml does not pin the audio cadence keys; the dataclass
     # defaults decide for v1 and the shipped MRV2 overlay re-pins them for v2.
-    v1 = _runtime_config_from_deploy_yaml("voxcpm2.yaml", use_v2_model_runner=False)
+    deploy_dir = Path(vllm_omni.__file__).resolve().parent / "deploy"
+    v1 = _runtime_config_from_deploy_yaml(deploy_dir / "voxcpm2.yaml", use_v2_model_runner=False)
     assert v1.vae_decode_every == 2
     assert v1.audio_emit_every == 1
 
-    v2 = _runtime_config_from_deploy_yaml("voxcpm2_mrv2.yaml", use_v2_model_runner=True)
+    v2 = _runtime_config_from_deploy_yaml(deploy_dir / "voxcpm2_mrv2.yaml", use_v2_model_runner=True)
     assert v2.vae_decode_every == 1
     assert v2.audio_emit_every == 3
 
@@ -110,15 +113,7 @@ def test_v2_overlay_on_base_yaml_uses_runner_defaults(monkeypatch, tmp_path, is_
     overlay = tmp_path / "voxcpm2_v2_overlay.yaml"
     overlay.write_text(f"base_config: {deploy_yaml}\nmodel_runner: v2\n")
 
-    merged = resolve_deploy_yaml(overlay)
-    runtime_dict = next(
-        stage["engine_extras"]["hf_overrides"]["voxcpm2_runtime_config"]
-        for stage in merged["stages"]
-        if "voxcpm2_runtime_config" in stage.get("engine_extras", {}).get("hf_overrides", {})
-    )
-    config = _VoxCPM2RuntimeConfig.from_vllm_config(
-        SimpleNamespace(model_config=SimpleNamespace(use_v2_model_runner=True, voxcpm2_runtime_config=runtime_dict))
-    )
+    config = _runtime_config_from_deploy_yaml(overlay, use_v2_model_runner=True)
     assert (config.vae_decode_every, config.audio_emit_every) == expected
 
 
