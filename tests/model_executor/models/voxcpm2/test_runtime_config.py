@@ -68,6 +68,10 @@ def test_runner_specific_audio_defaults(monkeypatch, uses_v2, is_cuda, expected)
         # The v2 cadence depends on the platform read at call time; assert the
         # fake was consulted so a module-level import can't silently bypass it.
         assert fake_platform.is_cuda_calls >= 1
+    else:
+        # The v1 cadence must stay platform-independent: from_vllm_config
+        # should not consult the platform on the legacy path at all.
+        assert fake_platform.is_cuda_calls == 0
 
 
 def test_mrv2_explicit_legacy_audio_override():
