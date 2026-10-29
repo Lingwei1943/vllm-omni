@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+import vllm_omni
+from vllm_omni.config.stage_config import resolve_deploy_yaml
 from vllm_omni.model_executor.models.voxcpm2.runtime_config import _VoxCPM2RuntimeConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -34,6 +37,54 @@ def test_mrv2_explicit_legacy_audio_override():
     assert not config.enable_incremental_vae
     assert config.vae_decode_every == 3
     assert config.audio_emit_every == 1
+
+
+def _runtime_config_from_deploy_yaml(name: str, use_v2_model_runner: bool) -> _VoxCPM2RuntimeConfig:
+    deploy_dir = Path(vllm_omni.__file__).resolve().parent / "deploy"
+    merged = resolve_deploy_yaml(deploy_dir / name)
+    runtime_dict = next(
+        stage["engine_extras"]["hf_overrides"]["voxcpm2_runtime_config"]
+        for stage in merged["stages"]
+        if "voxcpm2_runtime_config" in stage.get("engine_extras", {}).get("hf_overrides", {})
+    )
+    return _VoxCPM2RuntimeConfig.from_vllm_config(
+        SimpleNamespace(
+            model_config=SimpleNamespace(use_v2_model_runner=use_v2_model_runner, voxcpm2_runtime_config=runtime_dict)
+        )
+    )
+
+
+def test_deploy_yaml_resolves_effective_audio_defaults():
+    # The base yaml does not pin the audio cadence keys; the dataclass
+    # defaults decide for v1 and the shipped MRV2 overlay re-pins them for v2.
+    v1 = _runtime_config_from_deploy_yaml("voxcpm2.yaml", use_v2_model_runner=False)
+    assert v1.vae_decode_every == 2
+    assert v1.audio_emit_every == 1
+
+    v2 = _runtime_config_from_deploy_yaml("voxcpm2_mrv2.yaml", use_v2_model_runner=True)
+    assert v2.vae_decode_every == 1
+    assert v2.audio_emit_every == 3
+
+
+def test_v2_overlay_on_base_yaml_uses_mrv2_audio_defaults(tmp_path):
+    # A thin overlay built on the base yaml (base_config + model_runner: v2,
+    # no explicit cadence keys) must inherit the MRV2 values from
+    # runtime_config.py, not the v1 chunking cadence.
+    deploy_yaml = Path(vllm_omni.__file__).resolve().parent / "deploy" / "voxcpm2.yaml"
+    overlay = tmp_path / "voxcpm2_v2_overlay.yaml"
+    overlay.write_text(f"base_config: {deploy_yaml}\nmodel_runner: v2\n")
+
+    merged = resolve_deploy_yaml(overlay)
+    runtime_dict = next(
+        stage["engine_extras"]["hf_overrides"]["voxcpm2_runtime_config"]
+        for stage in merged["stages"]
+        if "voxcpm2_runtime_config" in stage.get("engine_extras", {}).get("hf_overrides", {})
+    )
+    config = _VoxCPM2RuntimeConfig.from_vllm_config(
+        SimpleNamespace(model_config=SimpleNamespace(use_v2_model_runner=True, voxcpm2_runtime_config=runtime_dict))
+    )
+    assert config.vae_decode_every == 1
+    assert config.audio_emit_every == 3
 
 
 @dataclass
