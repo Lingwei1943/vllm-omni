@@ -46,7 +46,10 @@ def test_runner_specific_audio_defaults(monkeypatch, uses_v2, is_cuda, expected)
     # silently changes every deployment that does not pin the keys itself.
     import vllm_omni.platforms as platforms_mod
 
-    monkeypatch.setattr(platforms_mod, "current_omni_platform", _FakeOmniPlatform(is_cuda))
+    # Patch the backing global, not the lazy attribute: assigning
+    # current_omni_platform writes a real module attribute that permanently
+    # shadows the lazy __getattr__ after monkeypatch restores it.
+    monkeypatch.setattr(platforms_mod, "_current_omni_platform", _FakeOmniPlatform(is_cuda))
     config = _VoxCPM2RuntimeConfig.from_vllm_config(
         SimpleNamespace(model_config=SimpleNamespace(use_v2_model_runner=uses_v2))
     )
@@ -108,7 +111,7 @@ def test_v2_overlay_on_base_yaml_uses_runner_defaults(monkeypatch, tmp_path, is_
     # runtime_config.py per platform, not inherit stale base-yaml pins.
     import vllm_omni.platforms as platforms_mod
 
-    monkeypatch.setattr(platforms_mod, "current_omni_platform", _FakeOmniPlatform(is_cuda))
+    monkeypatch.setattr(platforms_mod, "_current_omni_platform", _FakeOmniPlatform(is_cuda))
     deploy_yaml = Path(vllm_omni.__file__).resolve().parent / "deploy" / "voxcpm2.yaml"
     overlay = tmp_path / "voxcpm2_v2_overlay.yaml"
     overlay.write_text(f"base_config: {deploy_yaml}\nmodel_runner: v2\n")
