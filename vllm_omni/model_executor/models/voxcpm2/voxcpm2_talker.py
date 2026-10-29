@@ -77,17 +77,24 @@ def _get_cfm_npu_graph_runner():
 def _get_vae_npu_graph_runner():
     global _VAE_NPU_GRAPH_RUNNER
     if _VAE_NPU_GRAPH_RUNNER is None:
-        from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
-
-        torch.npu.config.allow_internal_format = False
-        _VAE_NPU_GRAPH_RUNNER = NPUExactGraphRunner(
-            max_graphs=32,
-            component_name="VoxCPM2 AudioVAE",
-            disable_config_hint="disable the AudioVAE NPUGraph",
-        )
-        if not _VAE_NPU_GRAPH_RUNNER.is_supported():
-            logger.warning("AudioVAE NPUGraph not supported; using eager execution")
+        # A/B escape hatch (backport of #8312's VLLM_OMNI_DISABLE_VAE_NPU_GRAPH):
+        # disables the AudioVAE NPUGraph AND the process-wide
+        # allow_internal_format flip below, for with/without benchmarking.
+        if os.environ.get("VLLM_OMNI_DISABLE_VAE_NPU_GRAPH", "0") == "1":
+            logger.info("AudioVAE NPUGraph disabled via VLLM_OMNI_DISABLE_VAE_NPU_GRAPH")
             _VAE_NPU_GRAPH_RUNNER = False
+        else:
+            from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
+
+            torch.npu.config.allow_internal_format = False
+            _VAE_NPU_GRAPH_RUNNER = NPUExactGraphRunner(
+                max_graphs=32,
+                component_name="VoxCPM2 AudioVAE",
+                disable_config_hint="disable the AudioVAE NPUGraph",
+            )
+            if not _VAE_NPU_GRAPH_RUNNER.is_supported():
+                logger.warning("AudioVAE NPUGraph not supported; using eager execution")
+                _VAE_NPU_GRAPH_RUNNER = False
     return _VAE_NPU_GRAPH_RUNNER if _VAE_NPU_GRAPH_RUNNER is not False else None
 
 
