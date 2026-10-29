@@ -20,12 +20,20 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _FakeOmniPlatform:
-    """Deterministic platform stand-in so cadence defaults are assertable on any runner."""
+    """Deterministic platform stand-in so cadence defaults are assertable on any runner.
+
+    Also counts ``is_cuda()`` calls so the tests can assert the fake was
+    actually consulted: from_vllm_config resolves the platform at call time
+    today, and these guards fail loudly if it ever switches to a module-level
+    import that would silently bypass the faked platform.
+    """
 
     def __init__(self, is_cuda: bool) -> None:
         self._is_cuda = is_cuda
+        self.is_cuda_calls = 0
 
     def is_cuda(self) -> bool:
+        self.is_cuda_calls += 1
         return self._is_cuda
 
 
@@ -49,12 +57,17 @@ def test_runner_specific_audio_defaults(monkeypatch, uses_v2, is_cuda, expected)
     # Patch the backing global, not the lazy attribute: assigning
     # current_omni_platform writes a real module attribute that permanently
     # shadows the lazy __getattr__ after monkeypatch restores it.
-    monkeypatch.setattr(platforms_mod, "_current_omni_platform", _FakeOmniPlatform(is_cuda))
+    fake_platform = _FakeOmniPlatform(is_cuda)
+    monkeypatch.setattr(platforms_mod, "_current_omni_platform", fake_platform)
     config = _VoxCPM2RuntimeConfig.from_vllm_config(
         SimpleNamespace(model_config=SimpleNamespace(use_v2_model_runner=uses_v2))
     )
     assert config.enable_incremental_vae is (uses_v2 and is_cuda)
     assert (config.vae_decode_every, config.audio_emit_every) == expected
+    if uses_v2:
+        # The v2 cadence depends on the platform read at call time; assert the
+        # fake was consulted so a module-level import can't silently bypass it.
+        assert fake_platform.is_cuda_calls >= 1
 
 
 def test_mrv2_explicit_legacy_audio_override():
@@ -111,13 +124,17 @@ def test_v2_overlay_on_base_yaml_uses_runner_defaults(monkeypatch, tmp_path, is_
     # runtime_config.py per platform, not inherit stale base-yaml pins.
     import vllm_omni.platforms as platforms_mod
 
-    monkeypatch.setattr(platforms_mod, "_current_omni_platform", _FakeOmniPlatform(is_cuda))
+    fake_platform = _FakeOmniPlatform(is_cuda)
+    monkeypatch.setattr(platforms_mod, "_current_omni_platform", fake_platform)
     deploy_yaml = Path(vllm_omni.__file__).resolve().parent / "deploy" / "voxcpm2.yaml"
     overlay = tmp_path / "voxcpm2_v2_overlay.yaml"
     overlay.write_text(f"base_config: {deploy_yaml}\nmodel_runner: v2\n")
 
     config = _runtime_config_from_deploy_yaml(overlay, use_v2_model_runner=True)
     assert (config.vae_decode_every, config.audio_emit_every) == expected
+    # Same call-time guard as the defaults test: the fake platform must be
+    # the one from_vllm_config consults.
+    assert fake_platform.is_cuda_calls >= 1
 
 
 @dataclass
