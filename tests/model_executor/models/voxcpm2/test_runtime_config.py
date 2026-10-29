@@ -19,14 +19,36 @@ from vllm_omni.model_executor.models.voxcpm2.runtime_config import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-@pytest.mark.parametrize("uses_v2", [False, True])
-def test_runner_specific_audio_defaults(uses_v2):
+class _FakeOmniPlatform:
+    """Deterministic platform stand-in so cadence defaults are assertable on any runner."""
+
+    def __init__(self, is_cuda: bool) -> None:
+        self._is_cuda = is_cuda
+
+    def is_cuda(self) -> bool:
+        return self._is_cuda
+
+
+@pytest.mark.parametrize(
+    ("uses_v2", "is_cuda", "expected"),
+    [
+        (False, False, (2, 1)),
+        (False, True, (2, 1)),
+        (True, False, (2, 1)),
+        (True, True, (1, 3)),
+    ],
+)
+def test_runner_specific_audio_defaults(monkeypatch, uses_v2, is_cuda, expected):
+    # Incremental VAE is a CUDA-only per-patch feature: CUDA v2 gets the MRV2
+    # audio profile (1/3); every other combination keeps the v1 cadence (2/1).
+    import vllm_omni.platforms as platforms_mod
+
+    monkeypatch.setattr(platforms_mod, "current_omni_platform", _FakeOmniPlatform(is_cuda))
     config = _VoxCPM2RuntimeConfig.from_vllm_config(
         SimpleNamespace(model_config=SimpleNamespace(use_v2_model_runner=uses_v2))
     )
-    assert config.enable_incremental_vae is uses_v2
-    assert config.vae_decode_every == (1 if uses_v2 else 2)
-    assert config.audio_emit_every == (3 if uses_v2 else 1)
+    assert config.enable_incremental_vae is (uses_v2 and is_cuda)
+    assert (config.vae_decode_every, config.audio_emit_every) == expected
 
 
 def test_mrv2_explicit_legacy_audio_override():
@@ -70,10 +92,20 @@ def test_deploy_yaml_resolves_effective_audio_defaults():
     assert v2.audio_emit_every == 3
 
 
-def test_v2_overlay_on_base_yaml_uses_mrv2_audio_defaults(tmp_path):
+@pytest.mark.parametrize(
+    ("is_cuda", "expected"),
+    [
+        (False, (2, 1)),  # non-CUDA v2 keeps the v1 cadence (incremental VAE is CUDA-only)
+        (True, (1, 3)),  # CUDA v2 must not inherit v1 cadence values from the base yaml
+    ],
+)
+def test_v2_overlay_on_base_yaml_uses_runner_defaults(monkeypatch, tmp_path, is_cuda, expected):
     # A thin overlay built on the base yaml (base_config + model_runner: v2,
-    # no explicit cadence keys) must inherit the MRV2 values from
-    # runtime_config.py, not the v1 chunking cadence.
+    # no explicit cadence keys) must resolve the audio cadence through
+    # runtime_config.py per platform, not inherit stale base-yaml pins.
+    import vllm_omni.platforms as platforms_mod
+
+    monkeypatch.setattr(platforms_mod, "current_omni_platform", _FakeOmniPlatform(is_cuda))
     deploy_yaml = Path(vllm_omni.__file__).resolve().parent / "deploy" / "voxcpm2.yaml"
     overlay = tmp_path / "voxcpm2_v2_overlay.yaml"
     overlay.write_text(f"base_config: {deploy_yaml}\nmodel_runner: v2\n")
@@ -87,8 +119,7 @@ def test_v2_overlay_on_base_yaml_uses_mrv2_audio_defaults(tmp_path):
     config = _VoxCPM2RuntimeConfig.from_vllm_config(
         SimpleNamespace(model_config=SimpleNamespace(use_v2_model_runner=True, voxcpm2_runtime_config=runtime_dict))
     )
-    assert config.vae_decode_every == 1
-    assert config.audio_emit_every == 3
+    assert (config.vae_decode_every, config.audio_emit_every) == expected
 
 
 @dataclass
