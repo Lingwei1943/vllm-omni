@@ -196,9 +196,10 @@ def test_disable_switch_leaves_patch_and_setup_inert(monkeypatch) -> None:
         ("0", 1),  # zero clamps to the 1 floor
         ("-3", 1),  # negative clamps to the 1 floor
         ("abc", 8),  # non-int warns and falls back to the default
+        ("16", 16),  # above the validated limit: honored, not clamped, but warned
     ],
 )
-def test_max_graphs_env_resolution(monkeypatch, raw, expected) -> None:
+def test_max_graphs_env_resolution(monkeypatch, caplog, raw, expected) -> None:
     FakeGraphRunner.instances.clear()
     FakeGraphRunner.supported = True
     monkeypatch.setattr(npu_adapter, "_get_npu_exact_graph_runner_cls", lambda: FakeGraphRunner)
@@ -207,8 +208,11 @@ def test_max_graphs_env_resolution(monkeypatch, raw, expected) -> None:
     else:
         monkeypatch.setenv("VLLM_OMNI_VOXCPM2_LOC_DIT_MAX_GRAPHS", raw)
 
-    model = FakeTalker()
-    npu_adapter.setup_voxcpm2_loc_dit_npu_graph(model)
+    with caplog.at_level("WARNING", logger="vllm_omni.platforms.npu.models.voxcpm2_talker"):
+        model = FakeTalker()
+        npu_adapter.setup_voxcpm2_loc_dit_npu_graph(model)
 
     runner = FakeGraphRunner.instances[0]
     assert runner.max_graphs == expected
+    warned = any("exceeds the validated CANN-stable" in r.message for r in caplog.records)
+    assert warned is (expected == 16), "the above-limit override must warn; the rest must not"
