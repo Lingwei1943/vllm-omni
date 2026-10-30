@@ -643,3 +643,37 @@ def test_vae_npu_graph_runner_is_per_instance(monkeypatch):
 
     # The same instance returns the same runner on repeated calls (memoized).
     assert talker_module._vae_npu_graph_runner_for(vae_a) is runner_a
+
+
+@pytest.mark.parametrize(
+    ("raw", "disabled"),
+    [
+        ("TRUE", True),
+        (" yes ", True),
+        ("0", False),
+        (None, False),
+    ],
+)
+def test_vae_npu_graph_disable_switch_truthy(monkeypatch, raw, disabled):
+    """The VAE escape hatch must accept the usual truthy spellings.
+
+    An operator setting true/yes expects the graph OFF; the exact-1 match
+    silently ignored those and kept the graph path enabled.
+    """
+    seen_pools, _ = _install_fake_npu(monkeypatch)
+    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_module
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(talker_module, "_NPU_INTERNAL_FORMAT_MUTATED", False)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+    if raw is None:
+        monkeypatch.delenv("VLLM_OMNI_DISABLE_VAE_NPU_GRAPH", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_OMNI_DISABLE_VAE_NPU_GRAPH", raw)
+
+    vae = type("V", (), {"decode": staticmethod(lambda *a, **k: None)})()
+    runner = talker_module._vae_npu_graph_runner_for(vae)
+    if disabled:
+        assert runner is False, f"env={raw!r} must disable the VAE NPUGraph"
+    else:
+        assert runner is not False, f"env={raw!r} must leave the VAE NPUGraph enabled"
