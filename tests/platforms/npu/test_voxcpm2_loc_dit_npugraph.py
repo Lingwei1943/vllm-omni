@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for the Ascend VoxCPM2 LocDiT NPUGraph adapter."""
 
+import logging
 import sys
 from types import SimpleNamespace
 
@@ -208,7 +209,12 @@ def test_max_graphs_env_resolution(monkeypatch, caplog, raw, expected) -> None:
     else:
         monkeypatch.setenv("VLLM_OMNI_VOXCPM2_LOC_DIT_MAX_GRAPHS", raw)
 
-    with caplog.at_level("WARNING", logger="vllm_omni.platforms.npu.models.voxcpm2_talker"):
+    # vLLM's logging setup may set propagate=False on this logger in some
+    # configurations, which would hide the warning from caplog; force the
+    # propagation on for the duration of the assertion.
+    test_logger = logging.getLogger("vllm_omni.platforms.npu.models.voxcpm2_talker")
+    with caplog.at_level("WARNING", logger=test_logger.name), monkeypatch.context() as m:
+        m.setattr(test_logger, "propagate", True)
         model = FakeTalker()
         npu_adapter.setup_voxcpm2_loc_dit_npu_graph(model)
 
