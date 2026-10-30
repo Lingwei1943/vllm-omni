@@ -3367,9 +3367,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 omni_platform.current_omni_platform.device_type == "cuda"
                 or getattr(omni_platform.current_omni_platform, "is_npu", lambda: False)()
             )
-            stop_mask_cpu = torch.empty(
-                len(pending), dtype=torch.bool, pin_memory=on_device
-            )
+            stop_mask_cpu = torch.empty(len(pending), dtype=torch.bool, pin_memory=on_device)
             # Canary: a host read that races ahead of the DMA observes True —
             # a deterministic wrong value for keep-going requests, caught by
             # the latch test's expected-value assertion (instead of
