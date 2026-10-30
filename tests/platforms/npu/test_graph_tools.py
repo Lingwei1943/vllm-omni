@@ -650,6 +650,8 @@ def test_vae_npu_graph_runner_is_per_instance(monkeypatch):
     [
         ("TRUE", True),
         (" yes ", True),
+        ("on", True),
+        ("false", False),
         ("0", False),
         (None, False),
     ],
