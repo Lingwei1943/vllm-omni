@@ -171,3 +171,44 @@ def test_loc_dit_npugraph_falls_back_when_apis_are_unavailable(monkeypatch) -> N
 
     assert not hasattr(model.estimator, "_voxcpm2_npu_graph_runner")
     FakeGraphRunner.supported = True
+
+
+def test_disable_switch_leaves_patch_and_setup_inert(monkeypatch) -> None:
+    FakeGraphRunner.instances.clear()
+    monkeypatch.setattr(npu_adapter, "_PATCHED", False)
+    monkeypatch.setattr(npu_adapter, "_original_init", None)
+    # truthy spellings beyond the exact "1" must disable too
+    monkeypatch.setenv("VLLM_OMNI_DISABLE_VOXCPM2_NPU_PATCH", "TRUE")
+
+    npu_adapter.apply_voxcpm2_talker_patch()
+    assert npu_adapter._PATCHED is False, "patch must not install under the disable switch"
+
+    # setup stays a no-op even for a talker with no tts.feat_decoder.estimator
+    npu_adapter.setup_voxcpm2_loc_dit_npu_graph(object())
+    assert FakeGraphRunner.instances == []
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, 8),  # unset -> the CANN-validated default
+        ("4", 4),  # valid int passes through
+        ("0", 1),  # zero clamps to the 1 floor
+        ("-3", 1),  # negative clamps to the 1 floor
+        ("abc", 8),  # non-int warns and falls back to the default
+    ],
+)
+def test_max_graphs_env_resolution(monkeypatch, raw, expected) -> None:
+    FakeGraphRunner.instances.clear()
+    FakeGraphRunner.supported = True
+    monkeypatch.setattr(npu_adapter, "_get_npu_exact_graph_runner_cls", lambda: FakeGraphRunner)
+    if raw is None:
+        monkeypatch.delenv("VLLM_OMNI_VOXCPM2_LOC_DIT_MAX_GRAPHS", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_OMNI_VOXCPM2_LOC_DIT_MAX_GRAPHS", raw)
+
+    model = FakeTalker()
+    npu_adapter.setup_voxcpm2_loc_dit_npu_graph(model)
+
+    runner = FakeGraphRunner.instances[0]
+    assert runner.max_graphs == expected
