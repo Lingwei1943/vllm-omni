@@ -2946,7 +2946,6 @@ async def create_video(
         ReferenceImage | None,
         ReferenceVideo | None,
         ReferenceAudio | None,
-        str | None,
         LatentEditInput | None,
     ] = Depends(_parse_video_form),
 ) -> VideoResponse:
@@ -2962,12 +2961,11 @@ async def create_video(
         reference_image,
         reference_video,
         reference_audio,
-        control_path,
         latent_edit_input,
     ) = ctx
 
     def _cleanup_request_resources() -> None:
-        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        _cleanup_video_references(reference_video, reference_audio, request, latent_edit_input)
         _cleanup_timeline_guides(request)
 
     task: asyncio.Task[None] | None = None
@@ -2983,7 +2981,6 @@ async def create_video(
                 reference_image,
                 reference_video,
                 reference_audio,
-                control_path,
                 app_state=raw_request.app.state,
                 latent_edit_input=latent_edit_input,
             )
@@ -3021,7 +3018,6 @@ async def create_video_sync(
         ReferenceImage | None,
         ReferenceVideo | None,
         ReferenceAudio | None,
-        str | None,
         LatentEditInput | None,
     ] = Depends(_parse_video_form),
 ) -> Response:
@@ -3041,7 +3037,6 @@ async def create_video_sync(
         reference_image,
         reference_video,
         reference_audio,
-        control_path,
         latent_edit_input,
     ) = ctx
     request_id = f"video_sync-{random_uuid()}"
@@ -3080,7 +3075,7 @@ async def create_video_sync(
             detail=f"Video generation failed: {str(exc)}",
         ) from exc
     finally:
-        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        _cleanup_video_references(reference_video, reference_audio, request, latent_edit_input)
         _cleanup_timeline_guides(request)
     inference_time_s = time.perf_counter() - started_at
 
