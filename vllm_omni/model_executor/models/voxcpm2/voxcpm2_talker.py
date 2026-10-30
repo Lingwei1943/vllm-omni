@@ -1199,6 +1199,13 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             state.cfm_output_gpu = None
         if self._current_request_id == request_id:
             self._current_request_id = None
+        # Once the last request is gone, the talker-level single-slot
+        # stop-mask source/event keep the final batch's GPU tensors alive
+        # indefinitely; drop them now that their consumer set is empty (the
+        # next precompute stages a fresh pair).
+        if not self._active_states:
+            self._pending_stop_mask_source = None
+            self._pending_stop_mask_event = None
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         # Defer cleanup: on_requests_finished is called before forward(),
@@ -3352,13 +3359,26 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 stop_logits.record_stream(self._stop_mask_stream)
             if model_state is not None:
                 stacked.record_stream(self._stop_mask_stream)
-            stop_mask_cpu = torch.empty(len(pending), dtype=torch.bool, pin_memory=True)
+            # pin_memory=True raises on recent PyTorch builds without an
+            # accelerator; gate it like the host-tensor path below. The
+            # pending states were filtered to this device's tensors above,
+            # so the side-stream copy only ever runs with a device present.
+            on_device = (
+                omni_platform.current_omni_platform.device_type == "cuda"
+                or getattr(omni_platform.current_omni_platform, "is_npu", lambda: False)()
+            )
+            stop_mask_cpu = torch.empty(
+                len(pending), dtype=torch.bool, pin_memory=on_device
+            )
             # Canary: a host read that races ahead of the DMA observes True —
             # a deterministic wrong value for keep-going requests, caught by
             # the latch test's expected-value assertion (instead of
             # uninitialized garbage that can accidentally match).
             stop_mask_cpu.fill_(True)
-            stop_mask_cpu.copy_(stop_mask_gpu, non_blocking=True)
+            if on_device:
+                stop_mask_cpu.copy_(stop_mask_gpu, non_blocking=True)
+            else:
+                stop_mask_cpu.copy_(stop_mask_gpu)
             copy_done.record(self._stop_mask_stream)
 
         for i, (state, _) in enumerate(pending):
