@@ -29,8 +29,9 @@ shapes that context:
 from __future__ import annotations
 
 import os
-import regex as re
 from typing import Any
+
+import regex as re
 
 _VOXCPM2_ZERO_SENTINEL = "\uee00"
 _VOXCPM2_LEAD_TEN_RE = re.compile(r"^10(?=[\u4e00-\u9fff])")
