@@ -8,11 +8,12 @@ import functools
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-torch = pytest.importorskip("torch")
+torch = pytest.importorskip("torch")  # noqa: F811 — guard import for optional torch envs
 
 
 @functools.lru_cache(maxsize=1)
@@ -42,6 +43,9 @@ def _make_bare_talker():
     talker._enable_profiling = False
     talker._audio_emit_every = 1
     talker._vae_decode_every = 1
+    # __new__ bypasses __init__, which normally derives this from the
+    # deployment dtype; collect/decode paths read it unconditionally.
+    talker._vae_dtype = torch.float32
     talker._enable_delayed_audio_copy = False
     talker._delayed_audio_copy_use_events = False
     talker._coalesce_audio_d2h = False
