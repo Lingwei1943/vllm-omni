@@ -8,6 +8,8 @@ from vllm_omni.entrypoints.openai.tts_adapters.voxcpm2_digits import (
     shape_voxcpm2_edge_digits,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 @pytest.fixture(autouse=True)
 def _edge_pad_on(monkeypatch):
