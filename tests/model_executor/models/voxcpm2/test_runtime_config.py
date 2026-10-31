@@ -57,6 +57,12 @@ def test_runner_specific_audio_defaults(monkeypatch, uses_v2, is_cuda, expected)
     # Patch the backing global, not the lazy attribute: assigning
     # current_omni_platform writes a real module attribute that permanently
     # shadows the lazy __getattr__ after monkeypatch restores it.
+    # An earlier test in the same process may have resolved the real platform
+    # into a module attribute (a direct assignment); delete that residue so
+    # the from-import falls back to the lazy __getattr__ and consults the
+    # fake below. Without this, the real CUDA platform answers and the fake
+    # records zero is_cuda() calls (buildkite 18587).
+    monkeypatch.delattr(platforms_mod, "current_omni_platform", raising=False)
     fake_platform = _FakeOmniPlatform(is_cuda)
     monkeypatch.setattr(platforms_mod, "_current_omni_platform", fake_platform)
     config = _VoxCPM2RuntimeConfig.from_vllm_config(
@@ -128,6 +134,12 @@ def test_v2_overlay_on_base_yaml_uses_runner_defaults(monkeypatch, tmp_path, is_
     # runtime_config.py per platform, not inherit stale base-yaml pins.
     import vllm_omni.platforms as platforms_mod
 
+    # An earlier test in the same process may have resolved the real platform
+    # into a module attribute (a direct assignment); delete that residue so
+    # the from-import falls back to the lazy __getattr__ and consults the
+    # fake below. Without this, the real CUDA platform answers and the fake
+    # records zero is_cuda() calls (buildkite 18587).
+    monkeypatch.delattr(platforms_mod, "current_omni_platform", raising=False)
     fake_platform = _FakeOmniPlatform(is_cuda)
     monkeypatch.setattr(platforms_mod, "_current_omni_platform", fake_platform)
     deploy_yaml = Path(vllm_omni.__file__).resolve().parent / "deploy" / "voxcpm2.yaml"
