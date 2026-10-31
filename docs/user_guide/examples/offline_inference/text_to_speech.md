@@ -946,4 +946,3 @@ finally:
     ``````
 ??? abstract "voxtral_tts/end2end.py"
     Large file omitted from the rendered docs. View it on GitHub: <https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/text_to_speech/voxtral_tts/end2end.py>.
-

@@ -1378,4 +1378,3 @@ curl -N -X POST http://localhost:8091/v1/audio/speech \
 
 ??? abstract "voxtral_tts/text_preprocess.py"
     Large file omitted from the rendered docs. View it on GitHub: <https://github.com/vllm-project/vllm-omni/blob/main/examples/online_serving/text_to_speech/voxtral_tts/text_preprocess.py>.
-

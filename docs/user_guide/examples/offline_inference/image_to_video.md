@@ -460,4 +460,3 @@ assets, see the [LoRA guide](https://github.com/vllm-project/vllm-omni/tree/main
 
 ??? abstract "image_to_video.py"
     Large file omitted from the rendered docs. View it on GitHub: <https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/image_to_video/image_to_video.py>.
-

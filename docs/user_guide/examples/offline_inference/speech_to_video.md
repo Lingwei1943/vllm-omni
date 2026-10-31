@@ -141,4 +141,3 @@ The S2V pipeline processes in the following stages:
 
 ??? abstract "speech_to_video.py"
     Large file omitted from the rendered docs. View it on GitHub: <https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/speech_to_video/speech_to_video.py>.
-

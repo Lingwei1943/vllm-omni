@@ -365,4 +365,3 @@ Then open `http://localhost:7862/` in your local browser to interact with the we
 
 ??? abstract "text_to_image.py"
     Large file omitted from the rendered docs. View it on GitHub: <https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/text_to_image/text_to_image.py>.
-

@@ -326,4 +326,3 @@ the shared [`image_to_video.py`](https://github.com/vllm-project/vllm-omni/tree/
 
 ??? abstract "text_to_video.py"
     Large file omitted from the rendered docs. View it on GitHub: <https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/text_to_video/text_to_video.py>.
-
