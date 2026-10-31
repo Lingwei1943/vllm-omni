@@ -29,7 +29,7 @@ shapes that context:
 from __future__ import annotations
 
 import os
-import re
+import regex as re
 from typing import Any
 
 _VOXCPM2_ZERO_SENTINEL = "\uee00"
