@@ -104,9 +104,12 @@ def _vae_npu_graph_runner_for(audio_vae: torch.nn.Module):
         runner = getattr(audio_vae, "_npu_graph_runner", None)
         if runner is not None:
             return runner
-        # Escape hatch: operators can disable the AudioVAE NPUGraph after a
-        # failed capture without restarting the process.
-        if os.environ.get("VLLM_OMNI_DISABLE_VAE_NPU_GRAPH", "0") == "1":
+        # Escape hatch: after a failed capture the runner refuses further
+        # in-process replay, so operators disable the AudioVAE NPUGraph by
+        # restarting the stage process with VLLM_OMNI_DISABLE_VAE_NPU_GRAPH=1.
+        # Accepts the usual truthy spellings, matching the patch-level
+        # VLLM_OMNI_DISABLE_VOXCPM2_NPU_PATCH switches.
+        if os.environ.get("VLLM_OMNI_DISABLE_VAE_NPU_GRAPH", "0").strip().lower() in {"1", "true", "yes", "on"}:
             logger.info("AudioVAE NPUGraph disabled via VLLM_OMNI_DISABLE_VAE_NPU_GRAPH")
             audio_vae._npu_graph_runner = False
             return False
