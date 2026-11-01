@@ -102,43 +102,32 @@ from vllm_omni.utils.speaker_cache import get_speaker_cache
 #      token gives a weak-but-right-syllable líng.
 #   4. TextNormalizer (digits -> numerals, 48 -> 四十八).
 _VOXCPM2_ZERO_SENTINEL = "\uee00"
-_VOXCPM2_LEAD_TEN_RE = re.compile(r"^10(?=[\u4e00-\u9fff])")
-_VOXCPM2_TRAIL_TEN_RE = re.compile(r"(?<![\d.])10$")
-_VOXCPM2_LEADING_DIGIT_RUN_RE = re.compile(r"^(\d{1,2})(?=[\u4e00-\u9fff])")
-_VOXCPM2_TRAILING_DIGIT_RUN_RE = re.compile(r"([\u4e00-\u9fff。！？，、；：])(\d{1,2})$")
-_VOXCPM2_TN_TRIGGER_RE = re.compile(r"[\d$%^*+=<>√≈²³]")
 _VOXCPM2_NORMALIZER = None
 
 
 def _voxcpm2_text_frontend(text: str) -> str:
+    # RE implementation (see vllm_omni/entrypoints/openai/tts_adapters/
+    # voxcpm2_digits.py — the PR'd module): prosody shaping (comma lead-in /
+    # sentence-final stop / lone-zero sentinel) + the guarded TextNormalizer.
+    from vllm_omni.entrypoints.openai.tts_adapters.voxcpm2_digits import (
+        _VOXCPM2_TN_TRIGGER_RE,
+        normalize_voxcpm2_text,
+        shape_voxcpm2_edge_digits,
+    )
+
+    global _VOXCPM2_NORMALIZER
     if not text:
         return text
-    if os.environ.get("VLLM_OMNI_SPEECH_EDGE_PAD", "1") != "0":
-        text = _VOXCPM2_LEAD_TEN_RE.sub("一十，", text)
-        text = _VOXCPM2_TRAIL_TEN_RE.sub("一十，", text)
-        text = _VOXCPM2_LEADING_DIGIT_RUN_RE.sub(r"\1，", text)
-        text = _VOXCPM2_TRAILING_DIGIT_RUN_RE.sub(r"\1\2，", text)
-        # hold lone edge '0' (now followed by our break) out of TN conversion
-        if text.startswith("0，"):
-            text = _VOXCPM2_ZERO_SENTINEL + text[1:]
-        if text.endswith("0，"):
-            text = text[:-2] + _VOXCPM2_ZERO_SENTINEL + "，"
-    if os.environ.get("VLLM_OMNI_SPEECH_TEXT_NORMALIZE", "1") != "0" and _VOXCPM2_TN_TRIGGER_RE.search(text):
-        global _VOXCPM2_NORMALIZER
-        if _VOXCPM2_NORMALIZER is None:
-            try:
-                from voxcpm.utils.text_normalize import TextNormalizer
+    text = shape_voxcpm2_edge_digits(text)
+    if _VOXCPM2_NORMALIZER is None:
+        try:
+            from voxcpm.utils.text_normalize import TextNormalizer
 
-                _VOXCPM2_NORMALIZER = TextNormalizer()
-            except Exception as exc:
-                logger.warning("VoxCPM2 TextNormalizer unavailable, TN disabled: %s", exc)
-                _VOXCPM2_NORMALIZER = False
-        if _VOXCPM2_NORMALIZER is not False:
-            try:
-                text = _VOXCPM2_NORMALIZER.normalize(text)
-            except Exception as exc:
-                logger.warning("VoxCPM2 text normalization failed, using raw text: %s", exc)
-    text = text.replace(_VOXCPM2_ZERO_SENTINEL, "0")
+            _VOXCPM2_NORMALIZER = TextNormalizer()
+        except Exception as exc:
+            logger.warning("VoxCPM2 TextNormalizer unavailable, TN disabled: %s", exc)
+            _VOXCPM2_NORMALIZER = False
+    text = normalize_voxcpm2_text(text, _VOXCPM2_NORMALIZER or None)
     return text
 
 
