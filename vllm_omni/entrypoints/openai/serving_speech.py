@@ -110,7 +110,6 @@ def _voxcpm2_text_frontend(text: str) -> str:
     # voxcpm2_digits.py — the PR'd module): prosody shaping (comma lead-in /
     # sentence-final stop / lone-zero sentinel) + the guarded TextNormalizer.
     from vllm_omni.entrypoints.openai.tts_adapters.voxcpm2_digits import (
-        _VOXCPM2_TN_TRIGGER_RE,
         normalize_voxcpm2_text,
         shape_voxcpm2_edge_digits,
     )
@@ -1123,9 +1122,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
                             with _wave.open(os.path.join(pool_dir, name), "rb") as w:
                                 sr = w.getframerate()
-                                x = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(
-                                    np.float32
-                                ) / 32768.0
+                                x = (
+                                    np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32)
+                                    / 32768.0
+                                )
                             cached.append((name, x.tolist(), sr))
                         except Exception as exc:
                             logger.warning("Anchor pool: skipping %s: %s", name, exc)
@@ -3965,8 +3965,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 request.non_streaming_mode,
                 request.task_type,
                 request.max_new_tokens,
-                {k: v for k, v in (getattr(raw_request, "headers", {}) or {}).items()
-                 if k.lower() in ("x-request-id", "authorization", "user-agent")},
+                {
+                    k: v
+                    for k, v in (getattr(raw_request, "headers", {}) or {}).items()
+                    if k.lower() in ("x-request-id", "authorization", "user-agent")
+                },
             )
             if request.is_streaming() and request.word_timestamps:
                 return self.create_error_response(
